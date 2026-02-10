@@ -62,6 +62,55 @@ ensure_python_modules(c("numpy", "xarray", "zarr", "fsspec","requests","aiohttp"
 
 registry <- jsonlite::fromJSON("config/source_registry.json", simplifyVector = TRUE)
 
+normalize_registry <- function(registry) {
+  if (!is.data.frame(registry$sources)) {
+    source_ids <- names(registry$sources)
+    registry$sources <- bind_rows(lapply(source_ids, function(source_id) {
+      src <- registry$sources[[source_id]]
+      tibble(
+        id = source_id,
+        label = src$label %||% source_id,
+        forecast_url = src$forecast_url %||% "",
+        obs_url = src$obs_url %||% "",
+        supports_ensemble = isTRUE(src$supports_ensemble)
+      )
+    }))
+  }
+
+  if (!is.data.frame(registry$canonical_variables)) {
+    canonical_ids <- names(registry$canonical_variables)
+    registry$canonical_variables <- bind_rows(lapply(canonical_ids, function(canonical_id) {
+      var_info <- registry$canonical_variables[[canonical_id]]
+      tibble(
+        id = canonical_id,
+        label = var_info$label %||% canonical_id,
+        forecast_var_by_source = list(var_info$forecast_var_by_source %||% list()),
+        obs_var_by_source = list(var_info$obs_var_by_source %||% list()),
+        metric_units = var_info$metric_units %||% "",
+        imperial_units = var_info$imperial_units %||% ""
+      )
+    }))
+  }
+
+  if (!is.data.frame(registry$pre_canned_points)) {
+    point_names <- names(registry$pre_canned_points)
+    registry$pre_canned_points <- bind_rows(lapply(point_names, function(point_name) {
+      pt <- registry$pre_canned_points[[point_name]]
+      tibble(
+        name = point_name,
+        lat = as.numeric(pt$lat %||% NA_real_),
+        lon = as.numeric(pt$lon %||% NA_real_)
+      )
+    }))
+  }
+
+  registry
+}
+
+`%||%` <- function(x, y) if (is.null(x) || length(x) == 0) y else x
+
+registry <- normalize_registry(registry)
+
 xr <- reticulate::import("xarray")
 np <- reticulate::import("numpy")
 py_builtins <- reticulate::import_builtins()
@@ -230,6 +279,7 @@ ui <- fluidPage(
   titlePanel("Dynamical Forecast Dashboard (Initial Build)"),
   sidebarLayout(
     sidebarPanel(
+      checkboxInput("debug_mode", "Debug mode (terminal logging)", value = FALSE),
       selectInput("data_mode", "Data mode", choices = c("forecast", "obs + forecast"), selected = "obs + forecast"),
       selectInput("source", "Source", choices = setNames(registry$sources$id, registry$sources$label)),
       selectInput("variable", "Variable", choices = setNames(registry$canonical_variables$id, registry$canonical_variables$label)),
@@ -259,6 +309,24 @@ ui <- fluidPage(
 )
 
 server <- function(input, output, session) {
+  debug_log <- function(step, ..., force = FALSE) {
+    debug_on <- isTRUE(force) || isTRUE(input$debug_mode)
+    if (!debug_on) return(invisible(NULL))
+
+    detail <- paste0(..., collapse = "")
+    timestamp <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+
+    if (nzchar(detail)) {
+      message(sprintf("[DEBUG %s] %s | %s", timestamp, step, detail))
+    } else {
+      message(sprintf("[DEBUG %s] %s", timestamp, step))
+    }
+
+    invisible(NULL)
+  }
+
+  debug_log("server_init", "Server started and reactive values initialized.", force = TRUE)
+
   rv <- reactiveValues(
     click_lat = 40.015,
     click_lon = -105.2705,
@@ -272,17 +340,39 @@ server <- function(input, output, session) {
 
   load_datasets <- function() {
     sid <- input$source
+    debug_log("load_datasets:start", "source=", sid)
     src_row <- registry$sources[registry$sources$id == sid, ]
+    if (nrow(src_row) == 0) {
+      debug_log("load_datasets:error", "No source found in registry for source id=", sid)
+      rv$forecast_ds <- NULL
+      rv$obs_ds <- NULL
+      return(invisible(NULL))
+    }
+
+    debug_log(
+      "load_datasets:urls",
+      "forecast_url=", src_row$forecast_url[[1]],
+      ", obs_url=", src_row$obs_url[[1]]
+    )
+
     rv$forecast_ds <- safe_open_zarr(src_row$forecast_url[[1]])
     rv$obs_ds <- safe_open_zarr(src_row$obs_url[[1]])
+
+    debug_log(
+      "load_datasets:result",
+      "forecast_loaded=", !is.null(rv$forecast_ds),
+      ", obs_loaded=", !is.null(rv$obs_ds)
+    )
   }
 
   observeEvent(input$refresh_metadata, {
+    debug_log("refresh_metadata:triggered", "Manual metadata refresh requested.")
     showNotification("Refreshing source metadata and reopening datasets...", type = "message")
     load_datasets()
   })
 
   observe({
+    debug_log("source_observer:triggered", "Source observer triggered.")
     load_datasets()
   })
 
@@ -333,8 +423,10 @@ server <- function(input, output, session) {
   missing_text <- reactive({
     sid <- input$source
     canonical_id <- input$variable
+    debug_log("missing_text:start", "source=", sid, ", variable=", canonical_id)
     fv <- get_var_name(sid, canonical_id, "forecast")
     ov <- get_var_name(sid, canonical_id, "obs")
+    debug_log("missing_text:mapping", "forecast_var=", fv, ", obs_var=", ov)
     missing <- c()
     if (!nzchar(fv)) missing <- c(missing, "forecast")
     if (input$data_mode == "obs + forecast" && !nzchar(ov)) missing <- c(missing, "obs")
@@ -357,6 +449,16 @@ server <- function(input, output, session) {
 
     fvar <- get_var_name(sid, canonical_id, "forecast")
     ovar <- get_var_name(sid, canonical_id, "obs")
+    debug_log(
+      "plot_data:config",
+      "source=", sid,
+      ", variable=", canonical_id,
+      ", forecast_var=", fvar,
+      ", obs_var=", ovar,
+      ", lead_days=", input$lead_days,
+      ", units=", input$units,
+      ", data_mode=", input$data_mode
+    )
 
     forecast_ts <- extract_timeseries(
       rv$forecast_ds,
@@ -380,18 +482,21 @@ server <- function(input, output, session) {
     }
 
     if (!is.null(forecast_ts)) {
+      debug_log("plot_data:forecast_ts", "rows=", nrow(forecast_ts$trace_df), ", members=", forecast_ts$n_members)
       forecast_ts$trace_df$value <- convert_units(forecast_ts$trace_df$value, canonical_id, input$units, registry)
       forecast_ts$pct_df <- forecast_ts$pct_df %>%
         mutate(across(starts_with("p"), ~convert_units(.x, canonical_id, input$units, registry)))
     }
 
     if (!is.null(obs_ts)) {
+      debug_log("plot_data:obs_ts", "rows=", nrow(obs_ts$trace_df))
       obs_ts$trace_df$value <- convert_units(obs_ts$trace_df$value, canonical_id, input$units, registry)
     }
 
     elapsed <- as.numeric(difftime(Sys.time(), t0, units = "secs")) * 1000
     rv$last_latency_ms <- elapsed
     rv$last_request_size <- paste0("timeseries: ", ifelse(is.null(forecast_ts), 0, nrow(forecast_ts$trace_df)), " rows")
+    debug_log("plot_data:done", "latency_ms=", round(elapsed, 2), ", request_size=", rv$last_request_size)
 
     list(forecast = forecast_ts, obs = obs_ts)
   })
@@ -440,6 +545,12 @@ server <- function(input, output, session) {
     sid <- isolate(input$source)
     canonical_id <- isolate(input$variable)
     src_row <- registry$sources[registry$sources$id == sid, ]
+    debug_log(
+      "raster:triggered",
+      "source=", sid,
+      ", variable=", canonical_id,
+      ", stat=", isolate(input$raster_stat)
+    )
 
     if (is.null(rv$bounds) || any(vapply(rv$bounds, is.null, logical(1)))) {
       showNotification("Map bounds unavailable. Move the map and click Refresh raster.", type = "warning")
@@ -448,6 +559,7 @@ server <- function(input, output, session) {
 
     area <- abs((rv$bounds$north - rv$bounds$south) * (rv$bounds$east - rv$bounds$west))
     stride <- if (area > 1000) 6 else if (area > 300) 4 else if (area > 100) 2 else 1
+    debug_log("raster:bounds", "area=", round(area, 2), ", stride=", stride)
 
     t0 <- Sys.time()
     raster_df <- extract_raster(
@@ -461,6 +573,7 @@ server <- function(input, output, session) {
     )
 
     if (is.null(raster_df) || nrow(raster_df) == 0) {
+      debug_log("raster:empty", "No raster data returned for current map extent.")
       showNotification("No raster data in current map extent. Move map and click Refresh raster.", type = "warning")
       return()
     }
@@ -468,6 +581,7 @@ server <- function(input, output, session) {
     raster_df$value <- convert_units(raster_df$value, canonical_id, isolate(input$units), registry)
     rv$last_latency_ms <- as.numeric(difftime(Sys.time(), t0, units = "secs")) * 1000
     rv$last_request_size <- paste0("raster: ", nrow(raster_df), " cells, stride=", stride)
+    debug_log("raster:done", "latency_ms=", round(rv$last_latency_ms, 2), ", request_size=", rv$last_request_size)
 
     output$raster_plot <- renderPlot({
       ggplot(raster_df, aes(x = longitude, y = latitude, fill = value)) +
