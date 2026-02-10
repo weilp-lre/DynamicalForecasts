@@ -81,12 +81,14 @@ py_builtins <- import_builtins()
 # decode_timedelta = TRUE helps when lead_time is timedelta encoded
 ds <- xr$open_zarr(source_url, decode_timedelta = TRUE, chunks = NULL)
 
-if (!(variable_name %in% names(ds$data_vars))) {
+available_vars <- as.character(py_to_r(py_builtins$list(ds$data_vars$keys())))
+
+if (!(variable_name %in% available_vars)) {
   stop(
     sprintf(
       "Variable '%s' not found in dataset. Available data_vars: %s",
       variable_name,
-      paste(names(ds$data_vars), collapse = ", ")
+      paste(available_vars, collapse = ", ")
     )
   )
 }
