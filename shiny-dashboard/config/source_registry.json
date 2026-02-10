@@ -1,0 +1,63 @@
+{
+  "sources": {
+    "gefs": {
+      "label": "NOAA GEFS (35-day ensemble)",
+      "forecast_url": "https://data.dynamical.org/noaa/gefs/forecast-35-day/latest.zarr?email=optional@email.com",
+      "obs_url": "https://data.dynamical.org/noaa/gefs/analysis/latest.zarr",
+      "supports_ensemble": true
+    },
+    "ecmwf_ifs_ens": {
+      "label": "ECMWF IFS ENS (15-day ensemble)",
+      "forecast_url": "https://data.dynamical.org/ecmwf/ifs-ens/forecast-15-day-0-25-degree/latest.zarr?email=optional@email.com",
+      "obs_url": "",
+      "supports_ensemble": true
+    }
+  },
+  "canonical_variables": {
+    "t2m": {
+      "label": "2m Temperature",
+      "forecast_var_by_source": {
+        "gefs": "temperature_2m",
+        "ecmwf_ifs_ens": "temperature_2m"
+      },
+      "obs_var_by_source": {
+        "gefs": "temperature_2m",
+        "ecmwf_ifs_ens": ""
+      },
+      "metric_units": "degC",
+      "imperial_units": "degF"
+    },
+    "precip_surface": {
+      "label": "Surface Precipitation",
+      "forecast_var_by_source": {
+        "gefs": "precipitation_surface",
+        "ecmwf_ifs_ens": "precipitation_surface"
+      },
+      "obs_var_by_source": {
+        "gefs": "precipitation_surface",
+        "ecmwf_ifs_ens": ""
+      },
+      "metric_units": "mm",
+      "imperial_units": "in"
+    },
+    "wind_u_100m": {
+      "label": "100m U-Wind",
+      "forecast_var_by_source": {
+        "gefs": "wind_u_100m",
+        "ecmwf_ifs_ens": "wind_u_100m"
+      },
+      "obs_var_by_source": {
+        "gefs": "",
+        "ecmwf_ifs_ens": ""
+      },
+      "metric_units": "m/s",
+      "imperial_units": "mph"
+    }
+  },
+  "pre_canned_points": [
+    {"name": "Boulder, CO", "lat": 40.015, "lon": -105.2705},
+    {"name": "New York, NY", "lat": 40.7128, "lon": -74.0060},
+    {"name": "Miami, FL", "lat": 25.7617, "lon": -80.1918},
+    {"name": "Toronto, ON", "lat": 43.6532, "lon": -79.3832}
+  ]
+}
