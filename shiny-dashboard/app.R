@@ -172,6 +172,31 @@ get_var_name <- function(source_id, canonical_id, mode = c("forecast", "obs")) {
 extract_timeseries <- function(ds, var_name, lat, lon, source_supports_ensemble = TRUE, lead_hours = 14 * 24) {
   if (is.null(ds) || !nzchar(var_name)) return(NULL)
 
+  extract_time_axis <- function(point_da) {
+    for (coord_name in c("valid_time", "time")) {
+      coord <- point_da$coords$get(coord_name)
+      if (!is.null(coord)) {
+        vals <- tryCatch(reticulate::py_to_r(coord$values), error = function(e) NULL)
+        if (!is.null(vals) && length(vals) > 0) {
+          return(as.POSIXct(vals, tz = "UTC"))
+        }
+      }
+    }
+
+    lead_coord <- point_da$coords$get("lead_time")
+    if (!is.null(lead_coord)) {
+      lead_vals <- tryCatch(
+        reticulate::py_to_r(lead_coord$astype("timedelta64[h]")$values),
+        error = function(e) NULL
+      )
+      if (!is.null(lead_vals) && length(lead_vals) > 0) {
+        return(as.POSIXct(as.numeric(lead_vals) * 3600, origin = "1970-01-01", tz = "UTC"))
+      }
+    }
+
+    NULL
+  }
+
   da <- ds[[var_name]]
   dims <- names(reticulate::py_to_r(da$dims))
 
@@ -183,9 +208,11 @@ extract_timeseries <- function(ds, var_name, lat, lon, source_supports_ensemble 
 
   if (source_supports_ensemble && "ensemble_member" %in% dims) {
     point_da <- da$sel(latitude = lat, longitude = lon, method = "nearest")
-    valid_time <- as.POSIXct(reticulate::py_to_r(point_da$coords$get("valid_time")$values), tz = "UTC")
+    valid_time <- extract_time_axis(point_da)
     member <- as.integer(reticulate::py_to_r(point_da$coords$get("ensemble_member")$values))
     vals <- reticulate::py_to_r(np$array(point_da$values))
+
+    if (is.null(valid_time) || !length(valid_time)) return(NULL)
 
     df <- expand.grid(valid_time = valid_time, ensemble_member = member)
     df$value <- as.numeric(as.vector(t(vals)))
@@ -205,11 +232,9 @@ extract_timeseries <- function(ds, var_name, lat, lon, source_supports_ensemble 
     list(trace_df = df, pct_df = pct, n_members = length(unique(df$ensemble_member)))
   } else {
     point_da <- da$sel(latitude = lat, longitude = lon, method = "nearest")
-    valid_time <- if (!is.null(point_da$coords$get("valid_time"))) {
-      as.POSIXct(reticulate::py_to_r(point_da$coords$get("valid_time")$values), tz = "UTC")
-    } else {
-      as.POSIXct(reticulate::py_to_r(point_da$coords$get("time")$values), tz = "UTC")
-    }
+    valid_time <- extract_time_axis(point_da)
+
+    if (is.null(valid_time) || !length(valid_time)) return(NULL)
 
     vals <- as.numeric(reticulate::py_to_r(point_da$values))
     df <- data.frame(valid_time = valid_time, ensemble_member = 0, value = vals)
@@ -402,7 +427,116 @@ server <- function(input, output, session) {
     paste0(dim_names, "=", as.integer(unname(dims_map)), collapse = ", ")
   }
 
-  log_zarr_request <- function(context, ds, var_name, extra = "") {
+  format_bytes <- function(n_bytes) {
+    if (is.null(n_bytes) || !is.finite(n_bytes) || n_bytes < 0) return("unknown")
+
+    units <- c("B", "KB", "MB", "GB", "TB")
+    idx <- 1
+    value <- as.numeric(n_bytes)
+    while (value >= 1024 && idx < length(units)) {
+      value <- value / 1024
+      idx <- idx + 1
+    }
+
+    sprintf("%.2f %s", value, units[[idx]])
+  }
+
+  estimate_dataarray_nbytes <- function(da, dims_override = NULL) {
+    if (is.null(da)) return(NA_real_)
+
+    dims_map <- if (is.null(dims_override)) {
+      tryCatch(reticulate::py_to_r(da$dims), error = function(e) NULL)
+    } else {
+      dims_override
+    }
+    if (is.null(dims_map) || length(dims_map) == 0) return(NA_real_)
+
+    dim_sizes <- as.numeric(unname(dims_map))
+    if (!length(dim_sizes) || any(!is.finite(dim_sizes))) return(NA_real_)
+
+    dtype_size <- tryCatch(as.numeric(reticulate::py_to_r(da$dtype$itemsize)), error = function(e) NA_real_)
+    if (!is.finite(dtype_size) || dtype_size <= 0) dtype_size <- 8
+
+    prod(dim_sizes) * dtype_size
+  }
+
+  estimate_point_request_nbytes <- function(ds, var_name, lead_hours, source_supports_ensemble = TRUE) {
+    if (is.null(ds) || !nzchar(var_name)) return(NA_real_)
+    da <- tryCatch(ds[[var_name]], error = function(e) NULL)
+    if (is.null(da)) return(NA_real_)
+
+    dims_map <- tryCatch(reticulate::py_to_r(da$dims), error = function(e) NULL)
+    if (is.null(dims_map) || length(dims_map) == 0) return(NA_real_)
+
+    dims_names <- names(dims_map)
+    dim_sizes <- as.numeric(unname(dims_map))
+    names(dim_sizes) <- dims_names
+
+    if ("lead_time" %in% dims_names && is.finite(lead_hours)) {
+      dim_sizes[["lead_time"]] <- min(dim_sizes[["lead_time"]], as.numeric(lead_hours) + 1)
+    }
+
+    dim_sizes <- dim_sizes[!(names(dim_sizes) %in% c("latitude", "longitude", "init_time"))]
+    if (!source_supports_ensemble) {
+      dim_sizes <- dim_sizes[!(names(dim_sizes) %in% c("ensemble_member", "member", "number"))]
+    }
+
+    estimate_dataarray_nbytes(da, dims_override = dim_sizes)
+  }
+
+  estimate_raster_request_nbytes <- function(ds, var_name, bounds, stride = 1, source_supports_ensemble = TRUE) {
+    if (is.null(ds) || !nzchar(var_name) || is.null(bounds)) return(NA_real_)
+    da <- tryCatch(ds[[var_name]], error = function(e) NULL)
+    if (is.null(da)) return(NA_real_)
+
+    lats <- tryCatch(as.numeric(reticulate::py_to_r(da$coords$get("latitude")$values)), error = function(e) numeric(0))
+    lons <- tryCatch(as.numeric(reticulate::py_to_r(da$coords$get("longitude")$values)), error = function(e) numeric(0))
+    if (!length(lats) || !length(lons)) return(NA_real_)
+
+    normalize_lon <- function(lon_values, lon_input) {
+      if (all(lon_values >= 0, na.rm = TRUE)) {
+        (lon_input + 360) %% 360
+      } else {
+        ((lon_input + 180) %% 360) - 180
+      }
+    }
+
+    lon_min_norm <- normalize_lon(lons, bounds$west)
+    lon_max_norm <- normalize_lon(lons, bounds$east)
+
+    lat_idx <- which(lats >= min(bounds$south, bounds$north) & lats <= max(bounds$south, bounds$north))
+    lon_idx <- if (lon_min_norm <= lon_max_norm) {
+      which(lons >= lon_min_norm & lons <= lon_max_norm)
+    } else {
+      which(lons >= lon_min_norm | lons <= lon_max_norm)
+    }
+
+    if (!length(lat_idx) || !length(lon_idx)) return(NA_real_)
+
+    stride <- max(1, as.integer(stride))
+    lat_n <- length(seq(1, length(lat_idx), by = stride))
+    lon_n <- length(seq(1, length(lon_idx), by = stride))
+
+    dims_map <- tryCatch(reticulate::py_to_r(da$dims), error = function(e) NULL)
+    if (is.null(dims_map) || length(dims_map) == 0) return(NA_real_)
+
+    dims_names <- names(dims_map)
+    dim_sizes <- as.numeric(unname(dims_map))
+    names(dim_sizes) <- dims_names
+
+    if ("latitude" %in% dims_names) dim_sizes[["latitude"]] <- lat_n
+    if ("longitude" %in% dims_names) dim_sizes[["longitude"]] <- lon_n
+    for (collapsed in c("lead_time", "valid_time", "time", "init_time", "step", "forecast_hour", "quantile")) {
+      if (collapsed %in% dims_names) dim_sizes[[collapsed]] <- 1
+    }
+    if (source_supports_ensemble && "ensemble_member" %in% dims_names) {
+      dim_sizes[["ensemble_member"]] <- 1
+    }
+
+    estimate_dataarray_nbytes(da, dims_override = dim_sizes)
+  }
+
+  log_zarr_request <- function(context, ds, var_name, extra = "", estimated_nbytes = NA_real_) {
     if (is.null(ds) || !nzchar(var_name)) {
       debug_log(
         paste0("zarr_request:", context),
@@ -424,11 +558,14 @@ server <- function(input, output, session) {
     dtype <- tryCatch(as.character(da$dtype), error = function(e) "unknown")
     dims_txt <- tryCatch(format_named_dims(da), error = function(e) paste0("<error: ", conditionMessage(e), ">"))
 
+    estimated_txt <- if (is.finite(estimated_nbytes)) format_bytes(estimated_nbytes) else "unknown"
+
     debug_log(
       paste0("zarr_request:", context),
       "var=", var_name,
       ", dtype=", dtype,
       ", dims=", dims_txt,
+      ", est_request_size=", estimated_txt,
       if (nzchar(extra)) paste0(", ", extra) else ""
     )
 
@@ -603,12 +740,31 @@ server <- function(input, output, session) {
       t0 <- Sys.time()
       rv$last_request_size <- NULL
 
+      point_forecast_nbytes <- estimate_point_request_nbytes(
+        rv$forecast_ds,
+        fvar,
+        lead_hours = isolate(input$lead_days) * 24,
+        source_supports_ensemble = isTRUE(src_row$supports_ensemble[[1]])
+      )
+      point_obs_nbytes <- if (isolate(input$data_mode) == "obs + forecast" && !is.null(rv$obs_ds) && nzchar(ovar)) {
+        estimate_point_request_nbytes(
+          rv$obs_ds,
+          ovar,
+          lead_hours = isolate(input$lead_days) * 24,
+          source_supports_ensemble = FALSE
+        )
+      } else {
+        NA_real_
+      }
+      raster_nbytes <- NA_real_
+
       debug_log("refresh_data:start", "source=", sid, ", variable=", canonical_id)
 
       log_zarr_request(
         "point_forecast",
         rv$forecast_ds,
         fvar,
+        estimated_nbytes = point_forecast_nbytes,
         extra = paste0(
           "lat=", sprintf("%.4f", rv$click_lat),
           ", lon=", sprintf("%.4f", rv$click_lon),
@@ -634,6 +790,7 @@ server <- function(input, output, session) {
           "point_observation",
           rv$obs_ds,
           ovar,
+          estimated_nbytes = point_obs_nbytes,
           extra = paste0(
             "lat=", sprintf("%.4f", rv$click_lat),
             ", lon=", sprintf("%.4f", rv$click_lon),
@@ -667,10 +824,19 @@ server <- function(input, output, session) {
       if (!is.null(rv$bounds) && !any(vapply(rv$bounds, is.null, logical(1)))) {
         area <- abs((rv$bounds$north - rv$bounds$south) * (rv$bounds$east - rv$bounds$west))
         stride <- if (area > 1000) 6 else if (area > 300) 4 else if (area > 100) 2 else 1
+        raster_nbytes <- estimate_raster_request_nbytes(
+          rv$forecast_ds,
+          fvar,
+          bounds = rv$bounds,
+          stride = stride,
+          source_supports_ensemble = isTRUE(src_row$supports_ensemble[[1]])
+        )
+
         log_zarr_request(
           "map_raster",
           rv$forecast_ds,
           fvar,
+          estimated_nbytes = raster_nbytes,
           extra = paste0(
             "bounds=[N:", sprintf("%.3f", rv$bounds$north),
             ", S:", sprintf("%.3f", rv$bounds$south),
@@ -694,14 +860,22 @@ server <- function(input, output, session) {
         )
         if (!is.null(raster_df) && nrow(raster_df) > 0) {
           raster_df$value <- convert_units(raster_df$value, canonical_id, isolate(input$units), registry)
-          rv$last_request_size <- paste0("point: ", ifelse(is.null(forecast_ts), 0, nrow(forecast_ts$trace_df)), " rows; raster: ", nrow(raster_df), " cells, stride=", stride)
+          rv$last_request_size <- paste0(
+            "point_forecast: ", ifelse(is.null(forecast_ts), 0, nrow(forecast_ts$trace_df)), " rows (~", format_bytes(point_forecast_nbytes), "); ",
+            "point_obs: ", ifelse(is.null(obs_ts), 0, nrow(obs_ts$trace_df)), " rows (~", format_bytes(point_obs_nbytes), "); ",
+            "raster: ", nrow(raster_df), " cells, stride=", stride, " (~", format_bytes(raster_nbytes), ")"
+          )
         }
       }
       rv$raster_data <- raster_df
 
       rv$last_latency_ms <- as.numeric(difftime(Sys.time(), t0, units = "secs")) * 1000
       if (is.null(rv$last_request_size)) {
-        rv$last_request_size <- paste0("point: ", ifelse(is.null(forecast_ts), 0, nrow(forecast_ts$trace_df)), " rows; raster: 0 cells")
+        rv$last_request_size <- paste0(
+          "point_forecast: ", ifelse(is.null(forecast_ts), 0, nrow(forecast_ts$trace_df)), " rows (~", format_bytes(point_forecast_nbytes), "); ",
+          "point_obs: ", ifelse(is.null(obs_ts), 0, nrow(obs_ts$trace_df)), " rows (~", format_bytes(point_obs_nbytes), "); ",
+          "raster: 0 cells (~", format_bytes(raster_nbytes), ")"
+        )
       }
       incProgress(1, detail = "Complete")
       debug_log("refresh_data:done", "latency_ms=", round(rv$last_latency_ms, 2), ", request_size=", rv$last_request_size)
@@ -711,6 +885,8 @@ server <- function(input, output, session) {
   output$timeseries <- renderPlotly({
     pd <- rv$point_data
     validate(need(!is.null(pd) && !is.null(pd$forecast), "Forecast data unavailable for the selected source/variable."))
+    validate(need(is.data.frame(pd$forecast$trace_df), "Forecast data request returned an invalid response."))
+    validate(need("valid_time" %in% names(pd$forecast$trace_df), "Forecast data does not include a usable time axis."))
     validate(need(nrow(pd$forecast$trace_df) > 0, "Forecast data request returned no rows."))
 
     unit_label <- resolve_units(input$variable, input$units, registry)
@@ -729,6 +905,8 @@ server <- function(input, output, session) {
       geom_line(data = pd$forecast$pct_df, aes(x = valid_time, y = p75), color = "#1f78b4", linewidth = 0.8)
 
     if (!is.null(pd$obs)) {
+      validate(need(is.data.frame(pd$obs$trace_df), "Observation data request returned an invalid response."))
+      validate(need("valid_time" %in% names(pd$obs$trace_df), "Observation data does not include a usable time axis."))
       p <- p + geom_line(
         data = pd$obs$trace_df,
         aes(x = valid_time, y = value),
