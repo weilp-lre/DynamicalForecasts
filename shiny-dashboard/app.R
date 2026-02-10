@@ -9,11 +9,63 @@ library(sf)
 library(rnaturalearth)
 library(rnaturalearthdata)
 
+# Clear variables
+rm(list = ls())
+# sets working directory to location of script
+source_path = rstudioapi::getActiveDocumentContext()$path
+setwd(dirname(source_path))
+getwd()
+
+
+ensure_python_modules <- function(modules, method = "auto") {
+  missing <- modules[!vapply(modules, reticulate::py_module_available, logical(1))]
+  
+  if (length(missing) == 0) {
+    cat("Python modules already available:", paste(modules, collapse = ", "), "\n")
+    return(invisible(TRUE))
+  }
+  
+  cat("Missing Python modules detected:", paste(missing, collapse = ", "), "\n")
+  cat("Attempting installation via reticulate::py_install() ...\n")
+  
+  tryCatch(
+    {
+      reticulate::py_install(missing, pip = TRUE, method = method)
+      still_missing <- missing[!vapply(missing, reticulate::py_module_available, logical(1))]
+      if (length(still_missing) > 0) {
+        stop(
+          sprintf(
+            "Python modules are still unavailable after install: %s",
+            paste(still_missing, collapse = ", ")
+          )
+        )
+      }
+      cat("Python module installation completed.\n")
+      invisible(TRUE)
+    },
+    error = function(e) {
+      stop(
+        paste0(
+          "Failed to install required Python modules via reticulate. ",
+          "Please install these modules into your reticulate Python environment and rerun: ",
+          paste(missing, collapse = ", "),
+          "\nOriginal error: ",
+          conditionMessage(e)
+        )
+      )
+    }
+  )
+}
+# Ensure Python packages are available in the active reticulate environment.
+ensure_python_modules(c("numpy", "xarray", "zarr", "fsspec","requests","aiohttp"))
+
+
 registry <- jsonlite::fromJSON("config/source_registry.json", simplifyVector = TRUE)
 
 xr <- reticulate::import("xarray")
 np <- reticulate::import("numpy")
 py_builtins <- reticulate::import_builtins()
+
 
 convert_units <- function(values, canonical_id, output_system, registry) {
   if (canonical_id == "t2m") {
