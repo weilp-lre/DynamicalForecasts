@@ -197,8 +197,18 @@ extract_timeseries <- function(ds, var_name, lat, lon, source_supports_ensemble 
     NULL
   }
 
+  get_dim_names <- function(da_obj) {
+    sizes <- tryCatch(reticulate::py_to_r(da_obj$sizes), error = function(e) NULL)
+    if (!is.null(names(sizes)) && length(names(sizes)) > 0) {
+      return(names(sizes))
+    }
+
+    dims <- tryCatch(reticulate::py_to_r(da_obj$dims), error = function(e) character(0))
+    as.character(unname(dims))
+  }
+
   da <- ds[[var_name]]
-  dims <- names(reticulate::py_to_r(da$dims))
+  dims <- get_dim_names(da)
 
   if ("init_time" %in% dims) da <- da$isel(init_time = as.integer(-1))
   if ("lead_time" %in% dims) {
@@ -245,21 +255,31 @@ extract_timeseries <- function(ds, var_name, lat, lon, source_supports_ensemble 
 }
 
 select_single_time_slice <- function(da, preferred_hour = "36h") {
-  dims <- names(reticulate::py_to_r(da$dims))
+  get_dim_names <- function(da_obj) {
+    sizes <- tryCatch(reticulate::py_to_r(da_obj$sizes), error = function(e) NULL)
+    if (!is.null(names(sizes)) && length(names(sizes)) > 0) {
+      return(names(sizes))
+    }
+
+    dims <- tryCatch(reticulate::py_to_r(da_obj$dims), error = function(e) character(0))
+    as.character(unname(dims))
+  }
+
+  dims <- get_dim_names(da)
 
   if ("init_time" %in% dims) {
     da <- da$isel(init_time = as.integer(-1))
-    dims <- names(reticulate::py_to_r(da$dims))
+    dims <- get_dim_names(da)
   }
 
   if ("lead_time" %in% dims) {
     da <- da$sel(lead_time = preferred_hour, method = "nearest")
-    dims <- names(reticulate::py_to_r(da$dims))
+    dims <- get_dim_names(da)
   }
 
   if ("valid_time" %in% dims) {
     da <- da$isel(valid_time = as.integer(-1))
-    dims <- names(reticulate::py_to_r(da$dims))
+    dims <- get_dim_names(da)
   }
 
   if ("time" %in% dims) {
@@ -307,7 +327,17 @@ extract_raster <- function(ds, var_name, bounds, stat_name = "single_member", so
   lon_idx <- lon_idx[seq(1, length(lon_idx), by = alpha_stride)]
 
   da <- da$isel(latitude = as.integer(lat_idx - 1), longitude = as.integer(lon_idx - 1))
-  dims <- names(reticulate::py_to_r(da$dims))
+  get_dim_names <- function(da_obj) {
+    sizes <- tryCatch(reticulate::py_to_r(da_obj$sizes), error = function(e) NULL)
+    if (!is.null(names(sizes)) && length(names(sizes)) > 0) {
+      return(names(sizes))
+    }
+
+    dims <- tryCatch(reticulate::py_to_r(da_obj$dims), error = function(e) character(0))
+    as.character(unname(dims))
+  }
+
+  dims <- get_dim_names(da)
 
   if (source_supports_ensemble && "ensemble_member" %in% dims) {
     if (stat_name == "single_member") {
@@ -328,11 +358,11 @@ extract_raster <- function(ds, var_name, bounds, stat_name = "single_member", so
     }
   }
 
-  dims <- names(reticulate::py_to_r(da$dims))
+  dims <- get_dim_names(da)
   for (dim_name in c("lead_time", "valid_time", "time", "init_time", "step", "forecast_hour", "quantile")) {
     if (dim_name %in% dims) {
       da <- da$isel(structure(list(as.integer(0)), names = dim_name))
-      dims <- names(reticulate::py_to_r(da$dims))
+      dims <- get_dim_names(da)
     }
   }
 
@@ -360,6 +390,8 @@ ui <- fluidPage(
       radioButtons("units", "Unit system", choices = c("Metric" = "metric", "Imperial" = "imperial"), inline = TRUE),
       radioButtons("time_axis", "Time axis", choices = c("Valid time" = "valid_time", "Lead time" = "lead_time"), inline = TRUE),
       sliderInput("lead_days", "Lead-time window (days)", min = 1, max = 35, value = 14),
+      checkboxInput("refresh_timeseries", "Refresh timeseries query", value = TRUE),
+      checkboxInput("refresh_raster", "Refresh raster query", value = FALSE),
       selectInput(
         "raster_stat",
         "Raster statistic",
@@ -441,17 +473,55 @@ server <- function(input, output, session) {
     sprintf("%.2f %s", value, units[[idx]])
   }
 
+  get_named_dim_sizes <- function(da) {
+    if (is.null(da)) return(NULL)
+
+    sizes <- tryCatch(reticulate::py_to_r(da$sizes), error = function(e) NULL)
+    if (!is.null(sizes) && length(sizes) > 0) {
+      if (!is.null(names(sizes)) && length(names(sizes)) > 0) {
+        dim_sizes <- as.numeric(unname(sizes))
+        names(dim_sizes) <- names(sizes)
+        return(dim_sizes)
+      }
+
+      if (is.list(sizes) && !is.null(names(sizes)) && length(names(sizes)) > 0) {
+        dim_sizes <- suppressWarnings(as.numeric(unlist(sizes, use.names = FALSE)))
+        names(dim_sizes) <- names(sizes)
+        return(dim_sizes)
+      }
+    }
+
+    dims_map <- tryCatch(reticulate::py_to_r(da$dims), error = function(e) NULL)
+    if (is.null(dims_map) || length(dims_map) == 0) return(NULL)
+
+    if (!is.null(names(dims_map)) && length(names(dims_map)) > 0) {
+      dim_sizes <- suppressWarnings(as.numeric(unname(dims_map)))
+      names(dim_sizes) <- names(dims_map)
+      return(dim_sizes)
+    }
+
+    dim_names <- as.character(unname(dims_map))
+    shape <- tryCatch(as.numeric(reticulate::py_to_r(da$shape)), error = function(e) numeric(0))
+    if (length(dim_names) && length(shape) == length(dim_names)) {
+      names(shape) <- dim_names
+      return(shape)
+    }
+
+    NULL
+  }
+
   estimate_dataarray_nbytes <- function(da, dims_override = NULL) {
     if (is.null(da)) return(NA_real_)
 
-    dims_map <- if (is.null(dims_override)) {
-      tryCatch(reticulate::py_to_r(da$dims), error = function(e) NULL)
+    dim_sizes <- if (is.null(dims_override)) {
+      get_named_dim_sizes(da)
     } else {
-      dims_override
+      suppressWarnings(as.numeric(dims_override))
     }
-    if (is.null(dims_map) || length(dims_map) == 0) return(NA_real_)
-
-    dim_sizes <- as.numeric(unname(dims_map))
+    if (!is.null(dims_override) && !is.null(names(dims_override))) {
+      names(dim_sizes) <- names(dims_override)
+    }
+    if (is.null(dim_sizes) || length(dim_sizes) == 0) return(NA_real_)
     if (!length(dim_sizes) || any(!is.finite(dim_sizes))) return(NA_real_)
 
     dtype_size <- tryCatch(as.numeric(reticulate::py_to_r(da$dtype$itemsize)), error = function(e) NA_real_)
@@ -465,12 +535,10 @@ server <- function(input, output, session) {
     da <- tryCatch(ds[[var_name]], error = function(e) NULL)
     if (is.null(da)) return(NA_real_)
 
-    dims_map <- tryCatch(reticulate::py_to_r(da$dims), error = function(e) NULL)
-    if (is.null(dims_map) || length(dims_map) == 0) return(NA_real_)
+    dim_sizes <- get_named_dim_sizes(da)
+    if (is.null(dim_sizes) || length(dim_sizes) == 0) return(NA_real_)
 
-    dims_names <- names(dims_map)
-    dim_sizes <- as.numeric(unname(dims_map))
-    names(dim_sizes) <- dims_names
+    dims_names <- names(dim_sizes)
 
     if ("lead_time" %in% dims_names && is.finite(lead_hours)) {
       dim_sizes[["lead_time"]] <- min(dim_sizes[["lead_time"]], as.numeric(lead_hours) + 1)
@@ -517,12 +585,10 @@ server <- function(input, output, session) {
     lat_n <- length(seq(1, length(lat_idx), by = stride))
     lon_n <- length(seq(1, length(lon_idx), by = stride))
 
-    dims_map <- tryCatch(reticulate::py_to_r(da$dims), error = function(e) NULL)
-    if (is.null(dims_map) || length(dims_map) == 0) return(NA_real_)
+    dim_sizes <- get_named_dim_sizes(da)
+    if (is.null(dim_sizes) || length(dim_sizes) == 0) return(NA_real_)
 
-    dims_names <- names(dims_map)
-    dim_sizes <- as.numeric(unname(dims_map))
-    names(dim_sizes) <- dims_names
+    dims_names <- names(dim_sizes)
 
     if ("latitude" %in% dims_names) dim_sizes[["latitude"]] <- lat_n
     if ("longitude" %in% dims_names) dim_sizes[["longitude"]] <- lon_n
@@ -734,6 +800,8 @@ server <- function(input, output, session) {
     withProgress(message = "Requesting data", value = 0, {
       sid <- isolate(input$source)
       canonical_id <- isolate(input$variable)
+      refresh_timeseries <- isTRUE(isolate(input$refresh_timeseries))
+      refresh_raster <- isTRUE(isolate(input$refresh_raster))
       src_row <- registry$sources[registry$sources$id == sid, ]
       fvar <- get_var_name(sid, canonical_id, "forecast")
       ovar <- get_var_name(sid, canonical_id, "obs")
@@ -758,34 +826,44 @@ server <- function(input, output, session) {
       }
       raster_nbytes <- NA_real_
 
-      debug_log("refresh_data:start", "source=", sid, ", variable=", canonical_id)
-
-      log_zarr_request(
-        "point_forecast",
-        rv$forecast_ds,
-        fvar,
-        estimated_nbytes = point_forecast_nbytes,
-        extra = paste0(
-          "lat=", sprintf("%.4f", rv$click_lat),
-          ", lon=", sprintf("%.4f", rv$click_lon),
-          ", lead_hours=", isolate(input$lead_days) * 24,
-          ", supports_ensemble=", isTRUE(src_row$supports_ensemble[[1]])
-        )
+      debug_log(
+        "refresh_data:start",
+        "source=", sid,
+        ", variable=", canonical_id,
+        ", refresh_timeseries=", refresh_timeseries,
+        ", refresh_raster=", refresh_raster
       )
 
-      incProgress(0.15, detail = "Fetching point forecast")
-      forecast_ts <- extract_timeseries(
-        rv$forecast_ds,
-        fvar,
-        rv$click_lat,
-        rv$click_lon,
-        source_supports_ensemble = isTRUE(src_row$supports_ensemble[[1]]),
-        lead_hours = isolate(input$lead_days) * 24
-      )
-
-      incProgress(0.45, detail = "Fetching point observations")
+      forecast_ts <- NULL
       obs_ts <- NULL
-      if (isolate(input$data_mode) == "obs + forecast" && !is.null(rv$obs_ds) && nzchar(ovar)) {
+      if (refresh_timeseries) {
+        point_t0 <- Sys.time()
+        log_zarr_request(
+          "point_forecast",
+          rv$forecast_ds,
+          fvar,
+          estimated_nbytes = point_forecast_nbytes,
+          extra = paste0(
+            "lat=", sprintf("%.4f", rv$click_lat),
+            ", lon=", sprintf("%.4f", rv$click_lon),
+            ", lead_hours=", isolate(input$lead_days) * 24,
+            ", supports_ensemble=", isTRUE(src_row$supports_ensemble[[1]])
+          )
+        )
+
+        incProgress(0.15, detail = "Fetching point forecast")
+        forecast_ts <- extract_timeseries(
+          rv$forecast_ds,
+          fvar,
+          rv$click_lat,
+          rv$click_lon,
+          source_supports_ensemble = isTRUE(src_row$supports_ensemble[[1]]),
+          lead_hours = isolate(input$lead_days) * 24
+        )
+        debug_log("refresh_data:point_forecast_done", "elapsed_ms=", round(as.numeric(difftime(Sys.time(), point_t0, units = "secs")) * 1000, 2))
+
+        incProgress(0.45, detail = "Fetching point observations")
+        if (isolate(input$data_mode) == "obs + forecast" && !is.null(rv$obs_ds) && nzchar(ovar)) {
         log_zarr_request(
           "point_observation",
           rv$obs_ds,
@@ -799,14 +877,18 @@ server <- function(input, output, session) {
           )
         )
 
-        obs_ts <- extract_timeseries(
-          rv$obs_ds,
-          ovar,
-          rv$click_lat,
-          rv$click_lon,
-          source_supports_ensemble = FALSE,
-          lead_hours = isolate(input$lead_days) * 24
-        )
+          obs_ts <- extract_timeseries(
+            rv$obs_ds,
+            ovar,
+            rv$click_lat,
+            rv$click_lon,
+            source_supports_ensemble = FALSE,
+            lead_hours = isolate(input$lead_days) * 24
+          )
+          debug_log("refresh_data:point_obs_done", "elapsed_ms=", round(as.numeric(difftime(Sys.time(), point_t0, units = "secs")) * 1000, 2))
+        }
+      } else {
+        incProgress(0.45, detail = "Skipping timeseries query")
       }
 
       if (!is.null(forecast_ts)) {
@@ -817,11 +899,16 @@ server <- function(input, output, session) {
       if (!is.null(obs_ts)) {
         obs_ts$trace_df$value <- convert_units(obs_ts$trace_df$value, canonical_id, isolate(input$units), registry)
       }
-      rv$point_data <- list(forecast = forecast_ts, obs = obs_ts)
+      if (refresh_timeseries) rv$point_data <- list(forecast = forecast_ts, obs = obs_ts)
 
-      incProgress(0.75, detail = "Fetching map raster")
       raster_df <- NULL
-      if (!is.null(rv$bounds) && !any(vapply(rv$bounds, is.null, logical(1)))) {
+      if (refresh_raster) {
+        incProgress(0.75, detail = "Fetching map raster")
+      } else {
+        incProgress(0.75, detail = "Skipping map raster query")
+      }
+      if (refresh_raster && !is.null(rv$bounds) && !any(vapply(rv$bounds, is.null, logical(1)))) {
+        raster_t0 <- Sys.time()
         area <- abs((rv$bounds$north - rv$bounds$south) * (rv$bounds$east - rv$bounds$west))
         stride <- if (area > 1000) 6 else if (area > 300) 4 else if (area > 100) 2 else 1
         raster_nbytes <- estimate_raster_request_nbytes(
@@ -858,23 +945,28 @@ server <- function(input, output, session) {
           alpha_stride = stride,
           valid_hour = "36h"
         )
+        debug_log("refresh_data:raster_done", "elapsed_ms=", round(as.numeric(difftime(Sys.time(), raster_t0, units = "secs")) * 1000, 2))
         if (!is.null(raster_df) && nrow(raster_df) > 0) {
           raster_df$value <- convert_units(raster_df$value, canonical_id, isolate(input$units), registry)
           rv$last_request_size <- paste0(
-            "point_forecast: ", ifelse(is.null(forecast_ts), 0, nrow(forecast_ts$trace_df)), " rows (~", format_bytes(point_forecast_nbytes), "); ",
-            "point_obs: ", ifelse(is.null(obs_ts), 0, nrow(obs_ts$trace_df)), " rows (~", format_bytes(point_obs_nbytes), "); ",
+            "point_forecast: ", if (refresh_timeseries) ifelse(is.null(forecast_ts), 0, nrow(forecast_ts$trace_df)) else "skipped", " rows (~", if (refresh_timeseries) format_bytes(point_forecast_nbytes) else "n/a", "); ",
+            "point_obs: ", if (refresh_timeseries) ifelse(is.null(obs_ts), 0, nrow(obs_ts$trace_df)) else "skipped", " rows (~", if (refresh_timeseries) format_bytes(point_obs_nbytes) else "n/a", "); ",
             "raster: ", nrow(raster_df), " cells, stride=", stride, " (~", format_bytes(raster_nbytes), ")"
           )
         }
       }
-      rv$raster_data <- raster_df
+      if (refresh_raster) rv$raster_data <- raster_df
 
       rv$last_latency_ms <- as.numeric(difftime(Sys.time(), t0, units = "secs")) * 1000
       if (is.null(rv$last_request_size)) {
         rv$last_request_size <- paste0(
-          "point_forecast: ", ifelse(is.null(forecast_ts), 0, nrow(forecast_ts$trace_df)), " rows (~", format_bytes(point_forecast_nbytes), "); ",
-          "point_obs: ", ifelse(is.null(obs_ts), 0, nrow(obs_ts$trace_df)), " rows (~", format_bytes(point_obs_nbytes), "); ",
-          "raster: 0 cells (~", format_bytes(raster_nbytes), ")"
+          "point_forecast: ",
+          if (refresh_timeseries) ifelse(is.null(forecast_ts), 0, nrow(forecast_ts$trace_df)) else "skipped",
+          " rows (~", if (refresh_timeseries) format_bytes(point_forecast_nbytes) else "n/a", "); ",
+          "point_obs: ",
+          if (refresh_timeseries) ifelse(is.null(obs_ts), 0, nrow(obs_ts$trace_df)) else "skipped",
+          " rows (~", if (refresh_timeseries) format_bytes(point_obs_nbytes) else "n/a", "); ",
+          "raster: ", if (refresh_raster) 0 else "skipped", " cells (~", if (refresh_raster) format_bytes(raster_nbytes) else "n/a", ")"
         )
       }
       incProgress(1, detail = "Complete")
