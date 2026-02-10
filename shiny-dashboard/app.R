@@ -141,6 +141,15 @@ resolve_units <- function(canonical_id, output_system, registry) {
   if (output_system == "metric") v$metric_units[[1]] else v$imperial_units[[1]]
 }
 
+resolve_variable_label <- function(canonical_id, registry) {
+  v <- registry$canonical_variables[registry$canonical_variables$id == canonical_id, ]
+  if (nrow(v) == 0) return(canonical_id)
+
+  label <- v$label[[1]]
+  label <- as.character(label)
+  if (!length(label) || !nzchar(label[[1]])) canonical_id else label[[1]]
+}
+
 safe_open_zarr <- function(url) {
   if (!nzchar(url)) return(NULL)
   tryCatch({
@@ -379,6 +388,53 @@ server <- function(input, output, session) {
 
   debug_log("server_init", "Server started and reactive values initialized.", force = TRUE)
 
+  format_named_dims <- function(da) {
+    if (is.null(da)) return("<null>")
+
+    dims_map <- reticulate::py_to_r(da$dims)
+    if (is.null(dims_map) || length(dims_map) == 0) return("<none>")
+
+    dim_names <- names(dims_map)
+    if (is.null(dim_names) || !length(dim_names)) {
+      return(paste(as.character(dims_map), collapse = ", "))
+    }
+
+    paste0(dim_names, "=", as.integer(unname(dims_map)), collapse = ", ")
+  }
+
+  log_zarr_request <- function(context, ds, var_name, extra = "") {
+    if (is.null(ds) || !nzchar(var_name)) {
+      debug_log(
+        paste0("zarr_request:", context),
+        "dataset_loaded=", !is.null(ds), ", var_name='", var_name, "'", if (nzchar(extra)) paste0(", ", extra) else ""
+      )
+      return(invisible(NULL))
+    }
+
+    da <- NULL
+    da <- tryCatch(ds[[var_name]], error = function(e) NULL)
+    if (is.null(da)) {
+      debug_log(
+        paste0("zarr_request:", context),
+        "var_name='", var_name, "' not found in dataset", if (nzchar(extra)) paste0(", ", extra) else ""
+      )
+      return(invisible(NULL))
+    }
+
+    dtype <- tryCatch(as.character(da$dtype), error = function(e) "unknown")
+    dims_txt <- tryCatch(format_named_dims(da), error = function(e) paste0("<error: ", conditionMessage(e), ">"))
+
+    debug_log(
+      paste0("zarr_request:", context),
+      "var=", var_name,
+      ", dtype=", dtype,
+      ", dims=", dims_txt,
+      if (nzchar(extra)) paste0(", ", extra) else ""
+    )
+
+    invisible(NULL)
+  }
+
   rv <- reactiveValues(
     click_lat = 40.015,
     click_lon = -105.2705,
@@ -549,6 +605,18 @@ server <- function(input, output, session) {
 
       debug_log("refresh_data:start", "source=", sid, ", variable=", canonical_id)
 
+      log_zarr_request(
+        "point_forecast",
+        rv$forecast_ds,
+        fvar,
+        extra = paste0(
+          "lat=", sprintf("%.4f", rv$click_lat),
+          ", lon=", sprintf("%.4f", rv$click_lon),
+          ", lead_hours=", isolate(input$lead_days) * 24,
+          ", supports_ensemble=", isTRUE(src_row$supports_ensemble[[1]])
+        )
+      )
+
       incProgress(0.15, detail = "Fetching point forecast")
       forecast_ts <- extract_timeseries(
         rv$forecast_ds,
@@ -562,6 +630,18 @@ server <- function(input, output, session) {
       incProgress(0.45, detail = "Fetching point observations")
       obs_ts <- NULL
       if (isolate(input$data_mode) == "obs + forecast" && !is.null(rv$obs_ds) && nzchar(ovar)) {
+        log_zarr_request(
+          "point_observation",
+          rv$obs_ds,
+          ovar,
+          extra = paste0(
+            "lat=", sprintf("%.4f", rv$click_lat),
+            ", lon=", sprintf("%.4f", rv$click_lon),
+            ", lead_hours=", isolate(input$lead_days) * 24,
+            ", supports_ensemble=FALSE"
+          )
+        )
+
         obs_ts <- extract_timeseries(
           rv$obs_ds,
           ovar,
@@ -587,6 +667,22 @@ server <- function(input, output, session) {
       if (!is.null(rv$bounds) && !any(vapply(rv$bounds, is.null, logical(1)))) {
         area <- abs((rv$bounds$north - rv$bounds$south) * (rv$bounds$east - rv$bounds$west))
         stride <- if (area > 1000) 6 else if (area > 300) 4 else if (area > 100) 2 else 1
+        log_zarr_request(
+          "map_raster",
+          rv$forecast_ds,
+          fvar,
+          extra = paste0(
+            "bounds=[N:", sprintf("%.3f", rv$bounds$north),
+            ", S:", sprintf("%.3f", rv$bounds$south),
+            ", W:", sprintf("%.3f", rv$bounds$west),
+            ", E:", sprintf("%.3f", rv$bounds$east),
+            "], area_deg2=", round(area, 2),
+            ", stride=", stride,
+            ", stat=", isolate(input$raster_stat),
+            ", valid_hour=36h"
+          )
+        )
+
         raster_df <- extract_raster(
           rv$forecast_ds,
           fvar,
@@ -615,8 +711,10 @@ server <- function(input, output, session) {
   output$timeseries <- renderPlotly({
     pd <- rv$point_data
     validate(need(!is.null(pd) && !is.null(pd$forecast), "Forecast data unavailable for the selected source/variable."))
+    validate(need(nrow(pd$forecast$trace_df) > 0, "Forecast data request returned no rows."))
 
     unit_label <- resolve_units(input$variable, input$units, registry)
+    variable_label <- resolve_variable_label(input$variable, registry)
 
     p <- ggplot() +
       geom_line(
@@ -641,7 +739,7 @@ server <- function(input, output, session) {
 
     p <- p +
       labs(
-        title = paste0(registry$canonical_variables$label[registry$canonical_variables$id == input$variable], " @ ", rv$click_name),
+        title = paste0(variable_label, " @ ", rv$click_name),
         subtitle = "Forecast spaghetti + percentile lines (25/50/75)",
         x = ifelse(input$time_axis == "valid_time", "Valid time", "Lead time"),
         y = unit_label
@@ -667,7 +765,7 @@ server <- function(input, output, session) {
       coord_quickmap(expand = FALSE) +
       theme_minimal(base_size = 12) +
       labs(
-        title = paste("Raster:", input$raster_stat, "for", registry$canonical_variables$label[registry$canonical_variables$id == canonical_id]),
+        title = paste("Raster:", input$raster_stat, "for", resolve_variable_label(canonical_id, registry)),
         subtitle = "Map request for one timestamp + bounded extent",
         x = "Longitude",
         y = "Latitude",
