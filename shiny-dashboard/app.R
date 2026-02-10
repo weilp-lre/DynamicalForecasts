@@ -210,6 +210,31 @@ extract_timeseries <- function(ds, var_name, lat, lon, source_supports_ensemble 
   }
 }
 
+select_single_time_slice <- function(da, preferred_hour = "36h") {
+  dims <- names(reticulate::py_to_r(da$dims))
+
+  if ("init_time" %in% dims) {
+    da <- da$isel(init_time = as.integer(-1))
+    dims <- names(reticulate::py_to_r(da$dims))
+  }
+
+  if ("lead_time" %in% dims) {
+    da <- da$sel(lead_time = preferred_hour, method = "nearest")
+    dims <- names(reticulate::py_to_r(da$dims))
+  }
+
+  if ("valid_time" %in% dims) {
+    da <- da$isel(valid_time = as.integer(-1))
+    dims <- names(reticulate::py_to_r(da$dims))
+  }
+
+  if ("time" %in% dims) {
+    da <- da$isel(time = as.integer(-1))
+  }
+
+  da
+}
+
 extract_raster <- function(ds, var_name, bounds, stat_name = "single_member", source_supports_ensemble = TRUE, alpha_stride = 1, valid_hour = "36h") {
   if (is.null(ds) || !nzchar(var_name) || is.null(bounds)) return(NULL)
 
@@ -219,39 +244,10 @@ extract_raster <- function(ds, var_name, bounds, stat_name = "single_member", so
   lon_max <- bounds$east
 
   da <- ds[[var_name]]
-  dims <- names(reticulate::py_to_r(da$dims))
-
-  if ("init_time" %in% dims) da <- da$isel(init_time = as.integer(-1))
-  if ("lead_time" %in% dims) da <- da$sel(lead_time = valid_hour, method = "nearest")
-
-  if (source_supports_ensemble && "ensemble_member" %in% dims) {
-    if (stat_name == "single_member") {
-      da <- da$isel(ensemble_member = as.integer(0))
-    } else {
-      q <- c(
-        p10 = 0.10,
-        p25 = 0.25,
-        median = 0.50,
-        p75 = 0.75,
-        p90 = 0.90
-      )
-      if (stat_name %in% names(q)) {
-        da <- da$quantile(q[[stat_name]], dim = "ensemble_member")
-      } else if (stat_name == "mean") {
-        da <- da$mean(dim = "ensemble_member")
-      } else if (stat_name == "min") {
-        da <- da$min(dim = "ensemble_member")
-      } else if (stat_name == "max") {
-        da <- da$max(dim = "ensemble_member")
-      } else {
-        da <- da$isel(ensemble_member = as.integer(0))
-      }
-    }
-  }
+  da <- select_single_time_slice(da, preferred_hour = valid_hour)
 
   grid_lats <- as.numeric(reticulate::py_to_r(da$coords$get("latitude")$values))
   grid_lons <- as.numeric(reticulate::py_to_r(da$coords$get("longitude")$values))
-
   if (length(grid_lats) == 0 || length(grid_lons) == 0) return(NULL)
 
   normalize_lon <- function(lon_values, lon_input) {
@@ -266,37 +262,60 @@ extract_raster <- function(ds, var_name, bounds, stat_name = "single_member", so
   lon_max_norm <- normalize_lon(grid_lons, lon_max)
 
   lat_idx <- which(grid_lats >= min(lat_min, lat_max) & grid_lats <= max(lat_min, lat_max))
-
   if (lon_min_norm <= lon_max_norm) {
     lon_idx <- which(grid_lons >= lon_min_norm & grid_lons <= lon_max_norm)
   } else {
     lon_idx <- which(grid_lons >= lon_min_norm | grid_lons <= lon_max_norm)
   }
-
   if (length(lat_idx) == 0 || length(lon_idx) == 0) return(NULL)
 
   lat_idx <- lat_idx[seq(1, length(lat_idx), by = alpha_stride)]
   lon_idx <- lon_idx[seq(1, length(lon_idx), by = alpha_stride)]
 
-  clipped <- da$isel(latitude = as.integer(lat_idx - 1), longitude = as.integer(lon_idx - 1))
+  da <- da$isel(latitude = as.integer(lat_idx - 1), longitude = as.integer(lon_idx - 1))
+  dims <- names(reticulate::py_to_r(da$dims))
 
-  lats <- as.numeric(reticulate::py_to_r(clipped$coords$get("latitude")$values))
-  lons <- as.numeric(reticulate::py_to_r(clipped$coords$get("longitude")$values))
-  vals <- reticulate::py_to_r(clipped$values)
-
-  if (length(dim(vals)) == 2) {
-    vals <- as.matrix(vals)
-  } else {
-    return(NULL)
+  if (source_supports_ensemble && "ensemble_member" %in% dims) {
+    if (stat_name == "single_member") {
+      da <- da$isel(ensemble_member = as.integer(0))
+    } else {
+      q <- c(p10 = 0.10, p25 = 0.25, median = 0.50, p75 = 0.75, p90 = 0.90)
+      if (stat_name %in% names(q)) {
+        da <- da$quantile(q[[stat_name]], dim = "ensemble_member")
+      } else if (stat_name == "mean") {
+        da <- da$mean(dim = "ensemble_member")
+      } else if (stat_name == "min") {
+        da <- da$min(dim = "ensemble_member")
+      } else if (stat_name == "max") {
+        da <- da$max(dim = "ensemble_member")
+      } else {
+        da <- da$isel(ensemble_member = as.integer(0))
+      }
+    }
   }
 
+  dims <- names(reticulate::py_to_r(da$dims))
+  for (dim_name in c("lead_time", "valid_time", "time", "init_time", "step", "forecast_hour", "quantile")) {
+    if (dim_name %in% dims) {
+      da <- da$isel(structure(list(as.integer(0)), names = dim_name))
+      dims <- names(reticulate::py_to_r(da$dims))
+    }
+  }
+
+  if (!all(c("latitude", "longitude") %in% dims) || length(dims) != 2) return(NULL)
+
+  lats <- as.numeric(reticulate::py_to_r(da$coords$get("latitude")$values))
+  lons <- as.numeric(reticulate::py_to_r(da$coords$get("longitude")$values))
+  vals <- as.matrix(reticulate::py_to_r(da$values))
   if (length(lats) == 0 || length(lons) == 0) return(NULL)
 
   expand.grid(longitude = lons, latitude = lats) %>%
     mutate(value = as.numeric(as.vector(t(vals))))
 }
 
+
 ui <- fluidPage(
+  tags$head(tags$style(HTML("@keyframes pulsebar {0% {opacity: 0.45;} 50% {opacity: 1;} 100% {opacity: 0.45;}}"))),
   titlePanel("Dynamical Forecast Dashboard (Initial Build)"),
   sidebarLayout(
     sidebarPanel(
@@ -320,6 +339,7 @@ ui <- fluidPage(
     ),
     mainPanel(
       textOutput("processing_status"),
+      uiOutput("loading_bar"),
       textOutput("missing_indicator"),
       tabsetPanel(
         tabPanel(
@@ -369,7 +389,9 @@ server <- function(input, output, session) {
     last_request_size = NA_character_,
     bounds = list(north = 55, south = 20, west = -130, east = -60),
     processing_count = 0,
-    processing_label = "Idle"
+    processing_label = "Idle",
+    point_data = NULL,
+    raster_data = NULL
   )
 
   start_processing <- function(label) {
@@ -398,6 +420,15 @@ server <- function(input, output, session) {
     }
   })
 
+  output$loading_bar <- renderUI({
+    if (rv$processing_count <= 0) return(NULL)
+    tags$div(
+      style = "width:100%;height:12px;background:#e9ecef;border-radius:6px;margin:6px 0 12px 0;overflow:hidden;",
+      tags$div(
+        style = "width:100%;height:100%;background:linear-gradient(90deg,#1f78b4,#7db8ff);animation: pulsebar 1.1s infinite ease-in-out;"
+      )
+    )
+  })
   load_datasets <- function() {
     start_processing("Loading datasets")
     on.exit(finish_processing(), add = TRUE)
@@ -502,71 +533,88 @@ server <- function(input, output, session) {
 
   output$missing_indicator <- renderText(missing_text())
 
-  plot_data <- eventReactive(input$refresh_data, {
+  observeEvent(input$refresh_data, {
     req(rv$forecast_ds)
-    t0 <- Sys.time()
+    start_processing("Refreshing point and map data")
+    on.exit(finish_processing(), add = TRUE)
 
-    sid <- input$source
-    canonical_id <- input$variable
-    src_row <- registry$sources[registry$sources$id == sid, ]
+    withProgress(message = "Requesting data", value = 0, {
+      sid <- isolate(input$source)
+      canonical_id <- isolate(input$variable)
+      src_row <- registry$sources[registry$sources$id == sid, ]
+      fvar <- get_var_name(sid, canonical_id, "forecast")
+      ovar <- get_var_name(sid, canonical_id, "obs")
+      t0 <- Sys.time()
+      rv$last_request_size <- NULL
 
-    fvar <- get_var_name(sid, canonical_id, "forecast")
-    ovar <- get_var_name(sid, canonical_id, "obs")
-    debug_log(
-      "plot_data:config",
-      "source=", sid,
-      ", variable=", canonical_id,
-      ", forecast_var=", fvar,
-      ", obs_var=", ovar,
-      ", lead_days=", input$lead_days,
-      ", units=", input$units,
-      ", data_mode=", input$data_mode
-    )
+      debug_log("refresh_data:start", "source=", sid, ", variable=", canonical_id)
 
-    forecast_ts <- extract_timeseries(
-      rv$forecast_ds,
-      fvar,
-      rv$click_lat,
-      rv$click_lon,
-      source_supports_ensemble = isTRUE(src_row$supports_ensemble[[1]]),
-      lead_hours = input$lead_days * 24
-    )
-
-    obs_ts <- NULL
-    if (input$data_mode == "obs + forecast" && !is.null(rv$obs_ds) && nzchar(ovar)) {
-      obs_ts <- extract_timeseries(
-        rv$obs_ds,
-        ovar,
+      incProgress(0.15, detail = "Fetching point forecast")
+      forecast_ts <- extract_timeseries(
+        rv$forecast_ds,
+        fvar,
         rv$click_lat,
         rv$click_lon,
-        source_supports_ensemble = FALSE,
-        lead_hours = input$lead_days * 24
+        source_supports_ensemble = isTRUE(src_row$supports_ensemble[[1]]),
+        lead_hours = isolate(input$lead_days) * 24
       )
-    }
 
-    if (!is.null(forecast_ts)) {
-      debug_log("plot_data:forecast_ts", "rows=", nrow(forecast_ts$trace_df), ", members=", forecast_ts$n_members)
-      forecast_ts$trace_df$value <- convert_units(forecast_ts$trace_df$value, canonical_id, input$units, registry)
-      forecast_ts$pct_df <- forecast_ts$pct_df %>%
-        mutate(across(starts_with("p"), ~convert_units(.x, canonical_id, input$units, registry)))
-    }
+      incProgress(0.45, detail = "Fetching point observations")
+      obs_ts <- NULL
+      if (isolate(input$data_mode) == "obs + forecast" && !is.null(rv$obs_ds) && nzchar(ovar)) {
+        obs_ts <- extract_timeseries(
+          rv$obs_ds,
+          ovar,
+          rv$click_lat,
+          rv$click_lon,
+          source_supports_ensemble = FALSE,
+          lead_hours = isolate(input$lead_days) * 24
+        )
+      }
 
-    if (!is.null(obs_ts)) {
-      debug_log("plot_data:obs_ts", "rows=", nrow(obs_ts$trace_df))
-      obs_ts$trace_df$value <- convert_units(obs_ts$trace_df$value, canonical_id, input$units, registry)
-    }
+      if (!is.null(forecast_ts)) {
+        forecast_ts$trace_df$value <- convert_units(forecast_ts$trace_df$value, canonical_id, isolate(input$units), registry)
+        forecast_ts$pct_df <- forecast_ts$pct_df %>%
+          mutate(across(starts_with("p"), ~convert_units(.x, canonical_id, isolate(input$units), registry)))
+      }
+      if (!is.null(obs_ts)) {
+        obs_ts$trace_df$value <- convert_units(obs_ts$trace_df$value, canonical_id, isolate(input$units), registry)
+      }
+      rv$point_data <- list(forecast = forecast_ts, obs = obs_ts)
 
-    elapsed <- as.numeric(difftime(Sys.time(), t0, units = "secs")) * 1000
-    rv$last_latency_ms <- elapsed
-    rv$last_request_size <- paste0("timeseries: ", ifelse(is.null(forecast_ts), 0, nrow(forecast_ts$trace_df)), " rows")
-    debug_log("plot_data:done", "latency_ms=", round(elapsed, 2), ", request_size=", rv$last_request_size)
+      incProgress(0.75, detail = "Fetching map raster")
+      raster_df <- NULL
+      if (!is.null(rv$bounds) && !any(vapply(rv$bounds, is.null, logical(1)))) {
+        area <- abs((rv$bounds$north - rv$bounds$south) * (rv$bounds$east - rv$bounds$west))
+        stride <- if (area > 1000) 6 else if (area > 300) 4 else if (area > 100) 2 else 1
+        raster_df <- extract_raster(
+          rv$forecast_ds,
+          fvar,
+          bounds = rv$bounds,
+          stat_name = isolate(input$raster_stat),
+          source_supports_ensemble = isTRUE(src_row$supports_ensemble[[1]]),
+          alpha_stride = stride,
+          valid_hour = "36h"
+        )
+        if (!is.null(raster_df) && nrow(raster_df) > 0) {
+          raster_df$value <- convert_units(raster_df$value, canonical_id, isolate(input$units), registry)
+          rv$last_request_size <- paste0("point: ", ifelse(is.null(forecast_ts), 0, nrow(forecast_ts$trace_df)), " rows; raster: ", nrow(raster_df), " cells, stride=", stride)
+        }
+      }
+      rv$raster_data <- raster_df
 
-    list(forecast = forecast_ts, obs = obs_ts)
+      rv$last_latency_ms <- as.numeric(difftime(Sys.time(), t0, units = "secs")) * 1000
+      if (is.null(rv$last_request_size)) {
+        rv$last_request_size <- paste0("point: ", ifelse(is.null(forecast_ts), 0, nrow(forecast_ts$trace_df)), " rows; raster: 0 cells")
+      }
+      incProgress(1, detail = "Complete")
+      debug_log("refresh_data:done", "latency_ms=", round(rv$last_latency_ms, 2), ", request_size=", rv$last_request_size)
+    })
   }, ignoreInit = FALSE)
 
   output$timeseries <- renderPlotly({
-    pd <- plot_data()
-    validate(need(!is.null(pd$forecast), "Forecast data unavailable for the selected source/variable."))
+    pd <- rv$point_data
+    validate(need(!is.null(pd) && !is.null(pd$forecast), "Forecast data unavailable for the selected source/variable."))
 
     unit_label <- resolve_units(input$variable, input$units, registry)
 
@@ -603,71 +651,28 @@ server <- function(input, output, session) {
     ggplotly(p)
   })
 
-  observeEvent(input$refresh_data, {
-    req(rv$forecast_ds)
-    start_processing("Refreshing map raster")
-    on.exit(finish_processing(), add = TRUE)
-
-    sid <- isolate(input$source)
-    canonical_id <- isolate(input$variable)
-    src_row <- registry$sources[registry$sources$id == sid, ]
-    debug_log(
-      "raster:triggered",
-      "source=", sid,
-      ", variable=", canonical_id,
-      ", stat=", isolate(input$raster_stat)
-    )
-
-    if (is.null(rv$bounds) || any(vapply(rv$bounds, is.null, logical(1)))) {
-      showNotification("Map bounds unavailable. Move the map and click Refresh data.", type = "warning")
-      return()
-    }
-
-    area <- abs((rv$bounds$north - rv$bounds$south) * (rv$bounds$east - rv$bounds$west))
-    stride <- if (area > 1000) 6 else if (area > 300) 4 else if (area > 100) 2 else 1
-    debug_log("raster:bounds", "area=", round(area, 2), ", stride=", stride)
-
-    t0 <- Sys.time()
-    raster_df <- extract_raster(
-      rv$forecast_ds,
-      get_var_name(sid, canonical_id, "forecast"),
-      bounds = rv$bounds,
-      stat_name = isolate(input$raster_stat),
-      source_supports_ensemble = isTRUE(src_row$supports_ensemble[[1]]),
-      alpha_stride = stride,
-      valid_hour = "36h"
-    )
-
-    if (is.null(raster_df) || nrow(raster_df) == 0) {
-      debug_log("raster:empty", "No raster data returned for current map extent.")
-      showNotification("No raster data in current map extent. Move map and click Refresh data.", type = "warning")
-      return()
-    }
-
-    raster_df$value <- convert_units(raster_df$value, canonical_id, isolate(input$units), registry)
-    rv$last_latency_ms <- as.numeric(difftime(Sys.time(), t0, units = "secs")) * 1000
-    rv$last_request_size <- paste0("raster: ", nrow(raster_df), " cells, stride=", stride)
-    debug_log("raster:done", "latency_ms=", round(rv$last_latency_ms, 2), ", request_size=", rv$last_request_size)
-
-    output$raster_plot <- renderPlot({
-      ggplot(raster_df, aes(x = longitude, y = latitude, fill = value)) +
-        geom_raster(alpha = isolate(input$raster_alpha)) +
-        scale_fill_viridis_c(option = "C") +
-        coord_quickmap(expand = FALSE) +
-        theme_minimal(base_size = 12) +
-        labs(
-          title = paste("Raster:", isolate(input$raster_stat), "for", registry$canonical_variables$label[registry$canonical_variables$id == canonical_id]),
-          subtitle = "Map extent based extraction + dynamic downsampling",
-          x = "Longitude",
-          y = "Latitude",
-          fill = resolve_units(canonical_id, isolate(input$units), registry)
-        )
-    })
-  }, ignoreInit = FALSE)
-
   output$raster_plot <- renderPlot({
-    plot.new()
-    text(0.5, 0.5, "Raster will appear after data is processed.")
+    req(rv$forecast_ds)
+    rdf <- rv$raster_data
+    if (is.null(rdf) || nrow(rdf) == 0) {
+      plot.new()
+      text(0.5, 0.5, "Raster will appear after clicking Refresh data.")
+      return(invisible(NULL))
+    }
+
+    canonical_id <- input$variable
+    ggplot(rdf, aes(x = longitude, y = latitude, fill = value)) +
+      geom_raster(alpha = input$raster_alpha) +
+      scale_fill_viridis_c(option = "C") +
+      coord_quickmap(expand = FALSE) +
+      theme_minimal(base_size = 12) +
+      labs(
+        title = paste("Raster:", input$raster_stat, "for", registry$canonical_variables$label[registry$canonical_variables$id == canonical_id]),
+        subtitle = "Map request for one timestamp + bounded extent",
+        x = "Longitude",
+        y = "Latitude",
+        fill = resolve_units(canonical_id, input$units, registry)
+      )
   })
 
   output$metrics <- renderText({
