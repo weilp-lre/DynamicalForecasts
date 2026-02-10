@@ -298,11 +298,22 @@ ui <- fluidPage(
       actionButton("refresh_metadata", "Refresh metadata")
     ),
     mainPanel(
+      textOutput("processing_status"),
       textOutput("missing_indicator"),
-      leafletOutput("map", height = 480),
-      br(),
-      plotlyOutput("timeseries", height = 330),
-      plotOutput("raster_plot", height = 420),
+      tabsetPanel(
+        tabPanel(
+          "Map",
+          br(),
+          leafletOutput("map", height = 480),
+          br(),
+          plotOutput("raster_plot", height = 420)
+        ),
+        tabPanel(
+          "Forecast Ensemble (point data)",
+          br(),
+          plotlyOutput("timeseries", height = 420)
+        )
+      ),
       verbatimTextOutput("metrics")
     )
   )
@@ -335,10 +346,41 @@ server <- function(input, output, session) {
     obs_ds = NULL,
     last_latency_ms = NA_real_,
     last_request_size = NA_character_,
-    bounds = list(north = 55, south = 20, west = -130, east = -60)
+    bounds = list(north = 55, south = 20, west = -130, east = -60),
+    processing_count = 0,
+    processing_label = "Idle"
   )
 
+  start_processing <- function(label) {
+    isolate({
+      rv$processing_count <- rv$processing_count + 1
+      rv$processing_label <- label
+    })
+    debug_log("processing:start", "label=", label, ", count=", rv$processing_count)
+  }
+
+  finish_processing <- function() {
+    isolate({
+      rv$processing_count <- max(0, rv$processing_count - 1)
+      if (rv$processing_count == 0) {
+        rv$processing_label <- "Idle"
+      }
+    })
+    debug_log("processing:finish", "count=", rv$processing_count)
+  }
+
+  output$processing_status <- renderText({
+    if (rv$processing_count > 0) {
+      paste0("Processing: ", rv$processing_label)
+    } else {
+      "Status: Ready"
+    }
+  })
+
   load_datasets <- function() {
+    start_processing("Loading datasets")
+    on.exit(finish_processing(), add = TRUE)
+
     sid <- input$source
     debug_log("load_datasets:start", "source=", sid)
     src_row <- registry$sources[registry$sources$id == sid, ]
@@ -503,7 +545,7 @@ server <- function(input, output, session) {
 
   output$timeseries <- renderPlotly({
     pd <- plot_data()
-    req(!is.null(pd$forecast))
+    validate(need(!is.null(pd$forecast), "Forecast data unavailable for the selected source/variable."))
 
     unit_label <- resolve_units(input$variable, input$units, registry)
 
@@ -542,6 +584,9 @@ server <- function(input, output, session) {
 
   observeEvent(list(input$refresh_raster, input$map_bounds), {
     req(rv$forecast_ds)
+    start_processing("Refreshing map raster")
+    on.exit(finish_processing(), add = TRUE)
+
     sid <- isolate(input$source)
     canonical_id <- isolate(input$variable)
     src_row <- registry$sources[registry$sources$id == sid, ]
@@ -598,6 +643,11 @@ server <- function(input, output, session) {
         )
     })
   }, ignoreInit = FALSE)
+
+  output$raster_plot <- renderPlot({
+    plot.new()
+    text(0.5, 0.5, "Raster will appear after data is processed.")
+  })
 
   output$metrics <- renderText({
     paste0(
