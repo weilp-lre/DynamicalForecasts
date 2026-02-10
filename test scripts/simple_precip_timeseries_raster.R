@@ -18,6 +18,46 @@ library(tigris)
 
 options(tigris_use_cache = TRUE)
 
+ensure_python_modules <- function(modules, method = "auto") {
+  missing <- modules[!vapply(modules, reticulate::py_module_available, logical(1))]
+
+  if (length(missing) == 0) {
+    cat("Python modules already available:", paste(modules, collapse = ", "), "\n")
+    return(invisible(TRUE))
+  }
+
+  cat("Missing Python modules detected:", paste(missing, collapse = ", "), "\n")
+  cat("Attempting installation via reticulate::py_install() ...\n")
+
+  tryCatch(
+    {
+      reticulate::py_install(missing, pip = TRUE, method = method)
+      still_missing <- missing[!vapply(missing, reticulate::py_module_available, logical(1))]
+      if (length(still_missing) > 0) {
+        stop(
+          sprintf(
+            "Python modules are still unavailable after install: %s",
+            paste(still_missing, collapse = ", ")
+          )
+        )
+      }
+      cat("Python module installation completed.\n")
+      invisible(TRUE)
+    },
+    error = function(e) {
+      stop(
+        paste0(
+          "Failed to install required Python modules via reticulate. ",
+          "Please install these modules into your reticulate Python environment and rerun: ",
+          paste(missing, collapse = ", "),
+          "\nOriginal error: ",
+          conditionMessage(e)
+        )
+      )
+    }
+  )
+}
+
 # -------------------- User-configurable test settings --------------------
 source_url <- "https://data.dynamical.org/noaa/gefs/forecast-35-day/latest.zarr?email=optional@email.com"
 lat0 <- 39.940
@@ -28,6 +68,9 @@ output_dir <- "test scripts/output"
 dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
 
 cat("Opening Zarr dataset:\n", source_url, "\n\n")
+
+# Ensure Python packages are available in the active reticulate environment.
+ensure_python_modules(c("numpy", "xarray", "zarr"))
 
 xr <- import("xarray")
 np <- import("numpy")
@@ -75,25 +118,30 @@ lat_max <- lat0 + bbox_pad
 lon_min <- lon0 - bbox_pad
 lon_max <- lon0 + bbox_pad
 
-# latitude can be descending in many weather grids; using slice(max, min) is common
+# latitude can be descending in many weather grids; using xr.slice(max, min) is common
 raster_da <- ds[["precipitation_surface"]]$isel(init_time = as.integer(-1), ensemble_member = as.integer(0))$sel(
   lead_time = lead_time_target,
   method = "nearest"
 )$sel(
-  latitude = reticulate::tuple(lat_max, lat_min),
-  longitude = reticulate::tuple(lon_min, lon_max)
+  latitude = xr$slice(lat_max, lat_min),
+  longitude = xr$slice(lon_min, lon_max)
 )
 
 lats <- as.numeric(py_to_r(raster_da$coords$get("latitude")$values))
 lons <- as.numeric(py_to_r(raster_da$coords$get("longitude")$values))
-vals <- as.numeric(py_to_r(np$array(raster_da$values)))
+vals_matrix <- py_to_r(np$array(raster_da$values))
 
-# Build grid; ordering is sufficient for a quick test visualization
-raster_df <- expand.grid(
-  longitude = lons,
-  latitude = lats
+# Build a plotting data frame (longitude x latitude grid)
+raster_df <- do.call(
+  rbind,
+  lapply(seq_along(lats), function(i) {
+    data.frame(
+      longitude = lons,
+      latitude = lats[i],
+      precipitation_surface = as.numeric(vals_matrix[i, ])
+    )
+  })
 )
-raster_df$precipitation_surface <- vals
 
 # County overlays (cartographic boundary files)
 counties_sf <- tigris::counties(cb = TRUE, year = 2023, class = "sf")

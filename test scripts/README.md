@@ -32,6 +32,8 @@ Python packages accessible via `reticulate`:
 - `zarr`
 - `numpy`
 
+The script now checks for these modules and attempts to install missing ones using `reticulate::py_install()` before import.
+
 ## Run
 
 ```bash
