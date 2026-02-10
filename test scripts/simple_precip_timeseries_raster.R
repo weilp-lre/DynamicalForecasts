@@ -70,7 +70,7 @@ dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
 cat("Opening Zarr dataset:\n", source_url, "\n\n")
 
 # Ensure Python packages are available in the active reticulate environment.
-ensure_python_modules(c("numpy", "xarray", "zarr"))
+ensure_python_modules(c("numpy", "xarray", "zarr", "fsspec","requests","aiohttp"))
 
 xr <- import("xarray")
 np <- import("numpy")
