@@ -250,23 +250,44 @@ extract_raster <- function(ds, var_name, bounds, stat_name = "single_member", so
   }
 
   grid_lats <- as.numeric(reticulate::py_to_r(da$coords$get("latitude")$values))
-  lat_slice <- if (length(grid_lats) >= 2 && grid_lats[1] > grid_lats[2]) {
-    py_builtins$slice(lat_max, lat_min)
-  } else {
-    py_builtins$slice(lat_min, lat_max)
-  }
-  lon_slice <- py_builtins$slice(lon_min, lon_max)
+  grid_lons <- as.numeric(reticulate::py_to_r(da$coords$get("longitude")$values))
 
-  clipped <- da$sel(latitude = lat_slice, longitude = lon_slice)
+  if (length(grid_lats) == 0 || length(grid_lons) == 0) return(NULL)
+
+  normalize_lon <- function(lon_values, lon_input) {
+    if (all(lon_values >= 0, na.rm = TRUE)) {
+      (lon_input + 360) %% 360
+    } else {
+      ((lon_input + 180) %% 360) - 180
+    }
+  }
+
+  lon_min_norm <- normalize_lon(grid_lons, lon_min)
+  lon_max_norm <- normalize_lon(grid_lons, lon_max)
+
+  lat_idx <- which(grid_lats >= min(lat_min, lat_max) & grid_lats <= max(lat_min, lat_max))
+
+  if (lon_min_norm <= lon_max_norm) {
+    lon_idx <- which(grid_lons >= lon_min_norm & grid_lons <= lon_max_norm)
+  } else {
+    lon_idx <- which(grid_lons >= lon_min_norm | grid_lons <= lon_max_norm)
+  }
+
+  if (length(lat_idx) == 0 || length(lon_idx) == 0) return(NULL)
+
+  lat_idx <- lat_idx[seq(1, length(lat_idx), by = alpha_stride)]
+  lon_idx <- lon_idx[seq(1, length(lon_idx), by = alpha_stride)]
+
+  clipped <- da$isel(latitude = as.integer(lat_idx - 1), longitude = as.integer(lon_idx - 1))
 
   lats <- as.numeric(reticulate::py_to_r(clipped$coords$get("latitude")$values))
   lons <- as.numeric(reticulate::py_to_r(clipped$coords$get("longitude")$values))
-  vals <- reticulate::py_to_r(np$array(clipped$values))
+  vals <- reticulate::py_to_r(clipped$values)
 
   if (length(dim(vals)) == 2) {
-    vals <- vals[seq(1, nrow(vals), by = alpha_stride), seq(1, ncol(vals), by = alpha_stride), drop = FALSE]
-    lats <- lats[seq(1, length(lats), by = alpha_stride)]
-    lons <- lons[seq(1, length(lons), by = alpha_stride)]
+    vals <- as.matrix(vals)
+  } else {
+    return(NULL)
   }
 
   if (length(lats) == 0 || length(lons) == 0) return(NULL)
@@ -294,7 +315,7 @@ ui <- fluidPage(
       ),
       sliderInput("raster_alpha", "Raster transparency", min = 0, max = 1, value = 0.8, step = 0.05),
       selectInput("preset_point", "Pre-canned location", choices = c("-- None --", registry$pre_canned_points$name)),
-      actionButton("refresh_raster", "Refresh raster"),
+      actionButton("refresh_data", "Refresh data"),
       actionButton("refresh_metadata", "Refresh metadata")
     ),
     mainPanel(
@@ -481,7 +502,7 @@ server <- function(input, output, session) {
 
   output$missing_indicator <- renderText(missing_text())
 
-  plot_data <- reactive({
+  plot_data <- eventReactive(input$refresh_data, {
     req(rv$forecast_ds)
     t0 <- Sys.time()
 
@@ -541,7 +562,7 @@ server <- function(input, output, session) {
     debug_log("plot_data:done", "latency_ms=", round(elapsed, 2), ", request_size=", rv$last_request_size)
 
     list(forecast = forecast_ts, obs = obs_ts)
-  })
+  }, ignoreInit = FALSE)
 
   output$timeseries <- renderPlotly({
     pd <- plot_data()
@@ -582,7 +603,7 @@ server <- function(input, output, session) {
     ggplotly(p)
   })
 
-  observeEvent(list(input$refresh_raster, input$map_bounds), {
+  observeEvent(input$refresh_data, {
     req(rv$forecast_ds)
     start_processing("Refreshing map raster")
     on.exit(finish_processing(), add = TRUE)
@@ -598,7 +619,7 @@ server <- function(input, output, session) {
     )
 
     if (is.null(rv$bounds) || any(vapply(rv$bounds, is.null, logical(1)))) {
-      showNotification("Map bounds unavailable. Move the map and click Refresh raster.", type = "warning")
+      showNotification("Map bounds unavailable. Move the map and click Refresh data.", type = "warning")
       return()
     }
 
@@ -619,7 +640,7 @@ server <- function(input, output, session) {
 
     if (is.null(raster_df) || nrow(raster_df) == 0) {
       debug_log("raster:empty", "No raster data returned for current map extent.")
-      showNotification("No raster data in current map extent. Move map and click Refresh raster.", type = "warning")
+      showNotification("No raster data in current map extent. Move map and click Refresh data.", type = "warning")
       return()
     }
 
