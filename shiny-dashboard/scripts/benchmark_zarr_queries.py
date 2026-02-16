@@ -22,6 +22,8 @@ import xarray as xr
 LAT_CANDIDATES = ("latitude", "lat", "y")
 LON_CANDIDATES = ("longitude", "lon", "x")
 TIME_CANDIDATES = ("valid_time", "time", "forecast_time")
+INIT_TIME_CANDIDATES = ("init_time", "forecast_reference_time", "reference_time")
+LEAD_TIME_CANDIDATES = ("lead_time", "step", "forecast_period")
 ENSEMBLE_CANDIDATES = ("number", "member", "ensemble_member")
 
 
@@ -68,6 +70,33 @@ def pick_dim(dataset: xr.Dataset, candidates: tuple[str, ...], label: str) -> st
         if candidate in dataset.dims:
             return candidate
     raise BenchmarkError(f"Could not find {label} dimension in dataset dims {tuple(dataset.dims)}")
+
+
+def pick_optional_dim(dataset: xr.Dataset, candidates: tuple[str, ...]) -> str | None:
+    for candidate in candidates:
+        if candidate in dataset.dims:
+            return candidate
+    return None
+
+
+def pick_temporal_dims(dataset: xr.Dataset) -> list[str]:
+    direct_time = pick_optional_dim(dataset, TIME_CANDIDATES)
+    if direct_time is not None:
+        return [direct_time]
+
+    init_time = pick_optional_dim(dataset, INIT_TIME_CANDIDATES)
+    lead_time = pick_optional_dim(dataset, LEAD_TIME_CANDIDATES)
+
+    dims: list[str] = []
+    if init_time is not None:
+        dims.append(init_time)
+    if lead_time is not None:
+        dims.append(lead_time)
+
+    if dims:
+        return dims
+
+    raise BenchmarkError(f"Could not find time dimension in dataset dims {tuple(dataset.dims)}")
 
 
 def choose_var(dataset: xr.Dataset, preferred: str) -> str:
@@ -129,7 +158,7 @@ def build_query_suite(registry: dict[str, Any]) -> list[QuerySpec]:
 def run_one_query(ds: xr.Dataset, source_id: str, var_name: str, spec: QuerySpec) -> dict[str, Any]:
     lat_dim = pick_dim(ds, LAT_CANDIDATES, "latitude")
     lon_dim = pick_dim(ds, LON_CANDIDATES, "longitude")
-    time_dim = pick_dim(ds, TIME_CANDIDATES, "time")
+    time_dims = pick_temporal_dims(ds)
     ens_dim = None
     for candidate in ENSEMBLE_CANDIDATES:
         if candidate in ds.dims:
@@ -138,13 +167,23 @@ def run_one_query(ds: xr.Dataset, source_id: str, var_name: str, spec: QuerySpec
 
     lat_count = fraction_to_count(ds.sizes[lat_dim], spec.region_fraction)
     lon_count = fraction_to_count(ds.sizes[lon_dim], spec.region_fraction)
-    time_count = fraction_to_count(ds.sizes[time_dim], spec.time_fraction)
+    if len(time_dims) == 1:
+        per_time_fraction = spec.time_fraction
+    else:
+        per_time_fraction = math.sqrt(spec.time_fraction)
+
+    time_counts: dict[str, int] = {
+        dim: fraction_to_count(ds.sizes[dim], per_time_fraction) for dim in time_dims
+    }
+    total_time_steps = math.prod(time_counts.values()) if time_counts else 0
 
     indexers: dict[str, Any] = {
         lat_dim: centered_slice(ds.sizes[lat_dim], lat_count),
         lon_dim: centered_slice(ds.sizes[lon_dim], lon_count),
-        time_dim: centered_slice(ds.sizes[time_dim], time_count),
     }
+
+    for dim, count in time_counts.items():
+        indexers[dim] = centered_slice(ds.sizes[dim], count)
 
     if ens_dim is not None:
         ens_count = fraction_to_count(ds.sizes[ens_dim], spec.ensemble_fraction)
@@ -174,7 +213,10 @@ def run_one_query(ds: xr.Dataset, source_id: str, var_name: str, spec: QuerySpec
         "throughput_mib_per_second": round(throughput, 3),
         "lat_points": lat_count,
         "lon_points": lon_count,
-        "time_steps": time_count,
+        "time_steps": total_time_steps,
+        "time_dims": "+".join(time_dims),
+        "init_steps": time_counts.get(pick_optional_dim(ds, INIT_TIME_CANDIDATES), 0),
+        "lead_steps": time_counts.get(pick_optional_dim(ds, LEAD_TIME_CANDIDATES), 0),
         "ensemble_members": ens_count,
         "status": "ok",
     }
@@ -266,6 +308,9 @@ def main() -> None:
                 "lat_points": None,
                 "lon_points": None,
                 "time_steps": None,
+                "time_dims": None,
+                "init_steps": None,
+                "lead_steps": None,
                 "ensemble_members": None,
                 "status": f"error: {exc}",
             }
