@@ -1,11 +1,11 @@
 query_id,description,source_id,variable,duration_seconds,output_size_bytes,output_size_mib,elements_returned,throughput_mib_per_second,lat_points,lon_points,time_steps,ensemble_members,status
-Q01,"Point sample, single time, 1 member",gefs,temperature_2m,,,,,,,,,,error: Cannot connect to host data.dynamical.org:443 ssl:default [Network is unreachable]
-Q02,"Point sample, ~1 day window, 1 member",ecmwf_ifs_ens,temperature_2m,,,,,,,,,,error: Cannot connect to host data.dynamical.org:443 ssl:default [Network is unreachable]
-Q03,"Point sample, ~7 day window, 1 member",gefs,temperature_2m,,,,,,,,,,error: Cannot connect to host data.dynamical.org:443 ssl:default [Network is unreachable]
-Q04,"Point sample, full time, all members",ecmwf_ifs_ens,temperature_2m,,,,,,,,,,error: Cannot connect to host data.dynamical.org:443 ssl:default [Network is unreachable]
-Q05,"Small regional box, single time, all members",gefs,temperature_2m,,,,,,,,,,error: Cannot connect to host data.dynamical.org:443 ssl:default [Network is unreachable]
-Q06,"Small regional box, ~3 day window, all members",ecmwf_ifs_ens,temperature_2m,,,,,,,,,,error: Cannot connect to host data.dynamical.org:443 ssl:default [Network is unreachable]
-Q07,"Medium regional box, ~3 day window, all members",gefs,temperature_2m,,,,,,,,,,error: Cannot connect to host data.dynamical.org:443 ssl:default [Network is unreachable]
-Q08,"Medium regional box, ~7 day window, all members",ecmwf_ifs_ens,temperature_2m,,,,,,,,,,error: Cannot connect to host data.dynamical.org:443 ssl:default [Network is unreachable]
-Q09,"Large regional box, ~7 day window, all members",gefs,temperature_2m,,,,,,,,,,error: Cannot connect to host data.dynamical.org:443 ssl:default [Network is unreachable]
-Q10,"Large regional box, full time, all members",ecmwf_ifs_ens,temperature_2m,,,,,,,,,,error: Cannot connect to host data.dynamical.org:443 ssl:default [Network is unreachable]
+Q01,"Point sample, single time, 1 member",gefs,temperature_2m,,,,,,,,,,"error: Could not find time dimension in dataset dims ('init_time', 'ensemble_member', 'lead_time', 'latitude', 'longitude')"
+Q02,"Point sample, ~1 day window, 1 member",ecmwf_ifs_ens,temperature_2m,,,,,,,,,,"error: Could not find time dimension in dataset dims ('init_time', 'lead_time', 'ensemble_member', 'latitude', 'longitude')"
+Q03,"Point sample, ~7 day window, 1 member",gefs,temperature_2m,,,,,,,,,,"error: Could not find time dimension in dataset dims ('init_time', 'ensemble_member', 'lead_time', 'latitude', 'longitude')"
+Q04,"Point sample, full time, all members",ecmwf_ifs_ens,temperature_2m,,,,,,,,,,"error: Could not find time dimension in dataset dims ('init_time', 'lead_time', 'ensemble_member', 'latitude', 'longitude')"
+Q05,"Small regional box, single time, all members",gefs,temperature_2m,,,,,,,,,,"error: Could not find time dimension in dataset dims ('init_time', 'ensemble_member', 'lead_time', 'latitude', 'longitude')"
+Q06,"Small regional box, ~3 day window, all members",ecmwf_ifs_ens,temperature_2m,,,,,,,,,,"error: Could not find time dimension in dataset dims ('init_time', 'lead_time', 'ensemble_member', 'latitude', 'longitude')"
+Q07,"Medium regional box, ~3 day window, all members",gefs,temperature_2m,,,,,,,,,,"error: Could not find time dimension in dataset dims ('init_time', 'ensemble_member', 'lead_time', 'latitude', 'longitude')"
+Q08,"Medium regional box, ~7 day window, all members",ecmwf_ifs_ens,temperature_2m,,,,,,,,,,"error: Could not find time dimension in dataset dims ('init_time', 'lead_time', 'ensemble_member', 'latitude', 'longitude')"
+Q09,"Large regional box, ~7 day window, all members",gefs,temperature_2m,,,,,,,,,,"error: Could not find time dimension in dataset dims ('init_time', 'ensemble_member', 'lead_time', 'latitude', 'longitude')"
+Q10,"Large regional box, full time, all members",ecmwf_ifs_ens,temperature_2m,,,,,,,,,,"error: Could not find time dimension in dataset dims ('init_time', 'lead_time', 'ensemble_member', 'latitude', 'longitude')"
