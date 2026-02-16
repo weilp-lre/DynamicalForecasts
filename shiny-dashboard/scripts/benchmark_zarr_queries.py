@@ -12,6 +12,7 @@ import json
 import math
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,20 @@ class BenchmarkError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class QueryPlan:
+    query: xr.DataArray
+    indexers: dict[str, Any]
+    lat_points: int
+    lon_points: int
+    time_steps: int
+    time_dims: list[str]
+    init_steps: int
+    lead_steps: int
+    ensemble_members: int
+    estimated_output_size_bytes: int
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -61,6 +76,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=10,
         help="How many benchmark queries to run (max 10 in current suite).",
+    )
+    parser.add_argument(
+        "--progress-log",
+        type=Path,
+        default=None,
+        help="Optional line-oriented progress log file (defaults to <output-dir>/zarr_query_benchmark_progress.log).",
     )
     return parser.parse_args()
 
@@ -127,6 +148,17 @@ def estimate_nbytes(da: xr.DataArray) -> int:
     return int(size * itemsize)
 
 
+def iso_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def append_progress(path: Path, message: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(f"[{iso_timestamp()}] {message}\n")
+        fh.flush()
+
+
 def build_query_suite(registry: dict[str, Any]) -> list[QuerySpec]:
     sources = [source_id for source_id, payload in registry["sources"].items() if payload.get("forecast_url")]
     if not sources:
@@ -155,7 +187,7 @@ def build_query_suite(registry: dict[str, Any]) -> list[QuerySpec]:
     ]
 
 
-def run_one_query(ds: xr.Dataset, source_id: str, var_name: str, spec: QuerySpec) -> dict[str, Any]:
+def build_query_plan(ds: xr.Dataset, var_name: str, spec: QuerySpec) -> QueryPlan:
     lat_dim = pick_dim(ds, LAT_CANDIDATES, "latitude")
     lon_dim = pick_dim(ds, LON_CANDIDATES, "longitude")
     time_dims = pick_temporal_dims(ds)
@@ -192,9 +224,27 @@ def run_one_query(ds: xr.Dataset, source_id: str, var_name: str, spec: QuerySpec
         ens_count = 0
 
     query = ds[var_name].isel(**indexers)
+    estimated_nbytes = estimate_nbytes(query)
+
+    return QueryPlan(
+        query=query,
+        indexers=indexers,
+        lat_points=lat_count,
+        lon_points=lon_count,
+        time_steps=total_time_steps,
+        time_dims=time_dims,
+        init_steps=time_counts.get(pick_optional_dim(ds, INIT_TIME_CANDIDATES), 0),
+        lead_steps=time_counts.get(pick_optional_dim(ds, LEAD_TIME_CANDIDATES), 0),
+        ensemble_members=ens_count,
+        estimated_output_size_bytes=estimated_nbytes,
+    )
+
+
+def run_one_query(ds: xr.Dataset, source_id: str, var_name: str, spec: QuerySpec) -> dict[str, Any]:
+    plan = build_query_plan(ds, var_name, spec)
 
     started = time.perf_counter()
-    loaded = query.load()
+    loaded = plan.query.load()
     duration = time.perf_counter() - started
 
     nbytes = estimate_nbytes(loaded)
@@ -211,13 +261,15 @@ def run_one_query(ds: xr.Dataset, source_id: str, var_name: str, spec: QuerySpec
         "output_size_mib": round(mib, 3),
         "elements_returned": int(loaded.size),
         "throughput_mib_per_second": round(throughput, 3),
-        "lat_points": lat_count,
-        "lon_points": lon_count,
-        "time_steps": total_time_steps,
-        "time_dims": "+".join(time_dims),
-        "init_steps": time_counts.get(pick_optional_dim(ds, INIT_TIME_CANDIDATES), 0),
-        "lead_steps": time_counts.get(pick_optional_dim(ds, LEAD_TIME_CANDIDATES), 0),
-        "ensemble_members": ens_count,
+        "lat_points": plan.lat_points,
+        "lon_points": plan.lon_points,
+        "time_steps": plan.time_steps,
+        "time_dims": "+".join(plan.time_dims),
+        "init_steps": plan.init_steps,
+        "lead_steps": plan.lead_steps,
+        "ensemble_members": plan.ensemble_members,
+        "estimated_output_size_bytes": plan.estimated_output_size_bytes,
+        "estimated_output_size_mib": round(plan.estimated_output_size_bytes / (1024 ** 2), 3),
         "status": "ok",
     }
 
@@ -280,10 +332,14 @@ def main() -> None:
     suite = suite[:requested_queries]
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    progress_log = args.progress_log or (args.output_dir / "zarr_query_benchmark_progress.log")
+    progress_log.write_text("", encoding="utf-8")
+    append_progress(progress_log, f"Starting benchmark run with {requested_queries} queries.")
+
     results: list[dict[str, Any]] = []
     datasets: dict[str, xr.Dataset] = {}
 
-    for spec in suite:
+    for query_number, spec in enumerate(suite, start=1):
         source_payload = registry["sources"][spec.source_id]
         url = source_payload["forecast_url"]
         var_hint = registry["canonical_variables"][spec.variable_alias]["forecast_var_by_source"].get(spec.source_id, "")
@@ -293,7 +349,55 @@ def main() -> None:
                 datasets[spec.source_id] = xr.open_zarr(url, chunks=None, decode_timedelta=True)
             ds = datasets[spec.source_id]
             var_name = choose_var(ds, var_hint)
-            result = run_one_query(ds, spec.source_id, var_name, spec)
+            plan = build_query_plan(ds, var_name, spec)
+            append_progress(
+                progress_log,
+                (
+                    f"[{query_number}/{requested_queries}] {spec.query_id} started "
+                    f"(source={spec.source_id}, variable={var_name}, "
+                    f"lat={plan.lat_points}, lon={plan.lon_points}, time_steps={plan.time_steps}, "
+                    f"ensemble_members={plan.ensemble_members}, "
+                    f"estimated_size_mib={plan.estimated_output_size_bytes / (1024 ** 2):.3f})."
+                ),
+            )
+
+            started = time.perf_counter()
+            loaded = plan.query.load()
+            duration = time.perf_counter() - started
+
+            nbytes = estimate_nbytes(loaded)
+            mib = nbytes / (1024 ** 2)
+            throughput = mib / duration if duration > 0 else float("inf")
+
+            result = {
+                "query_id": spec.query_id,
+                "description": spec.description,
+                "source_id": spec.source_id,
+                "variable": var_name,
+                "duration_seconds": round(duration, 3),
+                "output_size_bytes": nbytes,
+                "output_size_mib": round(mib, 3),
+                "elements_returned": int(loaded.size),
+                "throughput_mib_per_second": round(throughput, 3),
+                "lat_points": plan.lat_points,
+                "lon_points": plan.lon_points,
+                "time_steps": plan.time_steps,
+                "time_dims": "+".join(plan.time_dims),
+                "init_steps": plan.init_steps,
+                "lead_steps": plan.lead_steps,
+                "ensemble_members": plan.ensemble_members,
+                "estimated_output_size_bytes": plan.estimated_output_size_bytes,
+                "estimated_output_size_mib": round(plan.estimated_output_size_bytes / (1024 ** 2), 3),
+                "status": "ok",
+            }
+            append_progress(
+                progress_log,
+                (
+                    f"[{query_number}/{requested_queries}] {spec.query_id} finished "
+                    f"in {duration:.3f}s (actual_size_mib={mib:.3f}, "
+                    f"elements={int(loaded.size)}, throughput_mib_per_second={throughput:.3f})."
+                ),
+            )
         except Exception as exc:  # noqa: BLE001 - benchmark should continue on failure.
             result = {
                 "query_id": spec.query_id,
@@ -312,8 +416,14 @@ def main() -> None:
                 "init_steps": None,
                 "lead_steps": None,
                 "ensemble_members": None,
+                "estimated_output_size_bytes": None,
+                "estimated_output_size_mib": None,
                 "status": f"error: {exc}",
             }
+            append_progress(
+                progress_log,
+                f"[{query_number}/{requested_queries}] {spec.query_id} failed with error: {exc}",
+            )
         results.append(result)
 
     frame = pd.DataFrame(results)
@@ -322,9 +432,11 @@ def main() -> None:
 
     frame.to_csv(csv_path, index=False)
     summary_path.write_text(summarize(frame), encoding="utf-8")
+    append_progress(progress_log, f"Completed benchmark run. Wrote {csv_path} and {summary_path}.")
 
     print(f"Wrote {csv_path}")
     print(f"Wrote {summary_path}")
+    print(f"Wrote {progress_log}")
 
 
 if __name__ == "__main__":
