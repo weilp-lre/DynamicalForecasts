@@ -1,0 +1,16 @@
+[2026-02-16T20:02:55+00:00] Starting benchmark run with 10 queries.
+[2026-02-16T20:02:58+00:00] [1/10] Q01 started (source=gefs, variable=temperature_2m, lat=8, lon=15, time_steps=3743, ensemble_members=1, estimated_size_mib=1.713).
+[2026-02-16T20:03:41+00:00] [1/10] Q01 finished in 43.128s (actual_size_mib=1.713, elements=449160, throughput_mib_per_second=0.040).
+[2026-02-16T20:03:42+00:00] [2/10] Q02 started (source=ecmwf_ifs_ens, variable=temperature_2m, lat=8, lon=15, time_steps=2346, ensemble_members=1, estimated_size_mib=1.074).
+[2026-02-16T20:04:44+00:00] [2/10] Q02 finished in 62.016s (actual_size_mib=1.074, elements=281520, throughput_mib_per_second=0.017).
+[2026-02-16T20:04:44+00:00] [3/10] Q03 started (source=gefs, variable=temperature_2m, lat=8, lon=15, time_steps=71199, ensemble_members=1, estimated_size_mib=32.592).
+[2026-02-16T20:11:44+00:00] [3/10] Q03 finished in 420.141s (actual_size_mib=32.592, elements=8543880, throughput_mib_per_second=0.078).
+[2026-02-16T20:11:44+00:00] [4/10] Q04 started (source=ecmwf_ifs_ens, variable=temperature_2m, lat=8, lon=15, time_steps=58395, ensemble_members=51, estimated_size_mib=1363.287).
+[2026-02-16T20:15:45+00:00] [4/10] Q04 finished in 241.028s (actual_size_mib=1363.287, elements=357377400, throughput_mib_per_second=5.656).
+[2026-02-16T20:15:45+00:00] [5/10] Q05 started (source=gefs, variable=temperature_2m, lat=37, lon=72, time_steps=3743, ensemble_members=31, estimated_size_mib=1179.168).
+[2026-02-16T20:19:01+00:00] [5/10] Q05 finished in 195.498s (actual_size_mib=1179.168, elements=309111912, throughput_mib_per_second=6.032).
+[2026-02-16T20:19:01+00:00] [6/10] Q06 started (source=ecmwf_ifs_ens, variable=temperature_2m, lat=37, lon=72, time_steps=5886, ensemble_members=51, estimated_size_mib=3050.596).
+[2026-02-16T20:29:13+00:00] [6/10] Q06 finished in 612.076s (actual_size_mib=3050.596, elements=799695504, throughput_mib_per_second=4.984).
+[2026-02-16T20:29:13+00:00] [7/10] Q07 started (source=gefs, variable=temperature_2m, lat=109, lon=216, time_steps=36076, ensemble_members=31, estimated_size_mib=100443.167).
+[2026-02-16T20:29:14+00:00] [7/10] Q07 failed with error: Unable to allocate 98.1 GiB for an array with shape (622, 31, 58, 109, 216) and data type float32
+[2026-02-16T20:29:14+00:00] [8/10] Q08 started (source=ecmwf_ifs_ens, variable=temperature_2m, lat=109, lon=216, time_steps=12012, ensemble_members=51, estimated_size_mib=55020.664).
