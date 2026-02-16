@@ -1,0 +1,41 @@
+{
+  "query_id": "Q01",
+  "source_id": "gefs",
+  "variable": "temperature_2m",
+  "timestamp_utc": "2026-02-16T22:43:47.810314+00:00",
+  "lat_index": 360,
+  "lon_index": 720,
+  "dims": {
+    "lead_time": 6
+  },
+  "time_axis": [
+    "2026-02-16T00:00:00.000000000",
+    "2026-02-16T03:00:00.000000000",
+    "2026-02-16T06:00:00.000000000",
+    "2026-02-16T09:00:00.000000000",
+    "2026-02-16T12:00:00.000000000",
+    "2026-02-16T15:00:00.000000000"
+  ],
+  "values": [
+    27.375,
+    27.25,
+    27.375,
+    27.5,
+    27.625,
+    27.75
+  ],
+  "request": {
+    "query_id": "Q01",
+    "source_id": "gefs",
+    "variable_alias": "t2m",
+    "lat_index_fraction": 0.5,
+    "lon_index_fraction": 0.5,
+    "lead_count": 6
+  },
+  "metrics": {
+    "duration_seconds": 1.325,
+    "elements_returned": 6,
+    "estimated_bytes": 24
+  },
+  "status": "ok"
+}

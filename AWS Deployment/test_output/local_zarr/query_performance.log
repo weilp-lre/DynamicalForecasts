@@ -1,0 +1,12 @@
+2026-02-16 15:43:43,077 INFO starting local zarr smoke run query_count=10
+2026-02-16 15:43:47,830 INFO query=Q01 source=gefs duration_s=1.325 elements=6 bytes=24 status=ok
+2026-02-16 15:43:50,938 INFO query=Q02 source=ecmwf_ifs_ens duration_s=1.531 elements=6 bytes=24 status=ok
+2026-02-16 15:43:51,679 INFO query=Q03 source=gefs duration_s=0.713 elements=12 bytes=48 status=ok
+2026-02-16 15:43:53,132 INFO query=Q04 source=ecmwf_ifs_ens duration_s=1.432 elements=12 bytes=48 status=ok
+2026-02-16 15:43:53,938 INFO query=Q05 source=gefs duration_s=0.790 elements=24 bytes=96 status=ok
+2026-02-16 15:43:55,847 INFO query=Q06 source=ecmwf_ifs_ens duration_s=1.888 elements=24 bytes=96 status=ok
+2026-02-16 15:43:56,897 INFO query=Q07 source=gefs duration_s=1.011 elements=24 bytes=96 status=ok
+2026-02-16 15:43:58,222 INFO query=Q08 source=ecmwf_ifs_ens duration_s=1.259 elements=24 bytes=96 status=ok
+2026-02-16 15:43:59,348 INFO query=Q09 source=gefs duration_s=1.008 elements=48 bytes=192 status=ok
+2026-02-16 15:44:00,548 INFO query=Q10 source=ecmwf_ifs_ens duration_s=1.181 elements=48 bytes=192 status=ok
+2026-02-16 15:44:00,563 INFO completed local zarr smoke run summary_path=AWS Deployment\test_output\local_zarr\summary.json
