@@ -61,6 +61,7 @@ ensure_python_modules(c("numpy", "xarray", "zarr", "fsspec","requests","aiohttp"
 
 
 registry <- jsonlite::fromJSON("config/source_registry.json", simplifyVector = TRUE)
+request_limits <- jsonlite::fromJSON("config/request_limits.json", simplifyVector = TRUE)
 
 normalize_registry <- function(registry) {
   if (!is.data.frame(registry$sources)) {
@@ -110,6 +111,16 @@ normalize_registry <- function(registry) {
 `%||%` <- function(x, y) if (is.null(x) || length(x) == 0) y else x
 
 registry <- normalize_registry(registry)
+
+request_limits <- within(request_limits, {
+  forecast_window_days_default <- as.numeric(forecast_window_days_default %||% 14)
+  forecast_window_days_max <- as.numeric(forecast_window_days_max %||% forecast_window_days_default)
+  forecast_interval_hours <- as.numeric(forecast_interval_hours %||% 6)
+  obs_window_days <- as.numeric(obs_window_days %||% 7)
+  obs_interval_hours <- as.numeric(obs_interval_hours %||% forecast_interval_hours)
+  max_ensemble_members_per_request <- as.numeric(max_ensemble_members_per_request %||% 1)
+  prefer_latest_init_time <- isTRUE(prefer_latest_init_time)
+})
 
 xr <- reticulate::import("xarray")
 np <- reticulate::import("numpy")
@@ -169,8 +180,19 @@ get_var_name <- function(source_id, canonical_id, mode = c("forecast", "obs")) {
   if (is.null(out)) "" else out
 }
 
-extract_timeseries <- function(ds, var_name, lat, lon, source_supports_ensemble = TRUE, lead_hours = 14 * 24) {
+extract_timeseries <- function(
+  ds,
+  var_name,
+  lat,
+  lon,
+  source_supports_ensemble = TRUE,
+  lead_hours = 14 * 24,
+  interval_hours = 6,
+  max_ensemble_members = 1,
+  mode = c("forecast", "obs")
+) {
   if (is.null(ds) || !nzchar(var_name)) return(NULL)
+  mode <- match.arg(mode)
 
   extract_time_axis <- function(point_da) {
     for (coord_name in c("valid_time", "time")) {
@@ -207,17 +229,63 @@ extract_timeseries <- function(ds, var_name, lat, lon, source_supports_ensemble 
     as.character(unname(dims))
   }
 
+  thin_dim_by_interval <- function(point_da, dim_name, interval_hours) {
+    if (!is.finite(interval_hours) || interval_hours <= 0) return(point_da)
+
+    sizes <- tryCatch(reticulate::py_to_r(point_da$sizes), error = function(e) NULL)
+    if (is.null(sizes) || !(dim_name %in% names(sizes))) return(point_da)
+
+    dim_n <- as.numeric(sizes[[dim_name]])
+    if (!is.finite(dim_n) || dim_n <= 1) return(point_da)
+
+    base_step_hours <- 1
+    coord <- point_da$coords$get(dim_name)
+    if (!is.null(coord)) {
+      if (dim_name == "lead_time") {
+        coord_vals <- tryCatch(reticulate::py_to_r(coord$astype("timedelta64[h]")$values), error = function(e) NULL)
+        if (!is.null(coord_vals) && length(coord_vals) >= 2) {
+          coord_vals <- as.numeric(coord_vals)
+          coord_diff <- diff(coord_vals)
+          coord_diff <- coord_diff[is.finite(coord_diff) & coord_diff > 0]
+          if (length(coord_diff) > 0) base_step_hours <- max(1, min(coord_diff))
+        }
+      } else if (dim_name %in% c("valid_time", "time")) {
+        coord_vals <- tryCatch(as.POSIXct(reticulate::py_to_r(coord$values), tz = "UTC"), error = function(e) NULL)
+        if (!is.null(coord_vals) && length(coord_vals) >= 2) {
+          coord_diff <- as.numeric(diff(coord_vals), units = "hours")
+          coord_diff <- coord_diff[is.finite(coord_diff) & coord_diff > 0]
+          if (length(coord_diff) > 0) base_step_hours <- max(1, min(coord_diff))
+        }
+      }
+    }
+
+    stride <- max(1, as.integer(round(interval_hours / base_step_hours)))
+    if (stride <= 1) return(point_da)
+
+    point_da$isel(structure(list(py_builtins$slice(NULL, NULL, as.integer(stride))), names = dim_name))
+  }
+
   da <- ds[[var_name]]
   dims <- get_dim_names(da)
 
-  if ("init_time" %in% dims) da <- da$isel(init_time = as.integer(-1))
-  if ("lead_time" %in% dims) {
+  if (isTRUE(request_limits$prefer_latest_init_time) && "init_time" %in% dims) da <- da$isel(init_time = as.integer(-1))
+  if (mode == "forecast" && "lead_time" %in% dims) {
     lead_max <- as.integer(lead_hours)
     da <- da$sel(lead_time = py_builtins$slice(NULL, paste0(lead_max, "h")))
   }
 
   if (source_supports_ensemble && "ensemble_member" %in% dims) {
     point_da <- da$sel(latitude = lat, longitude = lon, method = "nearest")
+    point_da <- thin_dim_by_interval(point_da, "lead_time", interval_hours)
+    point_da <- thin_dim_by_interval(point_da, "valid_time", interval_hours)
+    point_da <- thin_dim_by_interval(point_da, "time", interval_hours)
+
+    max_members <- max(1, as.integer(max_ensemble_members %||% 1))
+    member_count <- as.integer(reticulate::py_to_r(point_da$sizes$get("ensemble_member")))
+    if (is.finite(member_count) && member_count > max_members) {
+      point_da <- point_da$isel(ensemble_member = py_builtins$slice(NULL, as.integer(max_members)))
+    }
+
     valid_time <- extract_time_axis(point_da)
     member <- as.integer(reticulate::py_to_r(point_da$coords$get("ensemble_member")$values))
     vals <- reticulate::py_to_r(np$array(point_da$values))
@@ -242,6 +310,30 @@ extract_timeseries <- function(ds, var_name, lat, lon, source_supports_ensemble 
     list(trace_df = df, pct_df = pct, n_members = length(unique(df$ensemble_member)))
   } else {
     point_da <- da$sel(latitude = lat, longitude = lon, method = "nearest")
+    if (mode == "obs") {
+      time_coord <- point_da$coords$get("time")
+      if (!is.null(time_coord)) {
+        time_vals <- tryCatch(as.POSIXct(reticulate::py_to_r(time_coord$values), tz = "UTC"), error = function(e) NULL)
+        if (!is.null(time_vals) && length(time_vals) > 0) {
+          end_time <- max(time_vals, na.rm = TRUE)
+          start_time <- end_time - as.difftime(as.numeric(request_limits$obs_window_days) * 24, units = "hours")
+          point_da <- point_da$sel(time = py_builtins$slice(as.character(start_time), as.character(end_time)))
+        }
+      }
+      valid_coord <- point_da$coords$get("valid_time")
+      if (!is.null(valid_coord)) {
+        valid_vals <- tryCatch(as.POSIXct(reticulate::py_to_r(valid_coord$values), tz = "UTC"), error = function(e) NULL)
+        if (!is.null(valid_vals) && length(valid_vals) > 0) {
+          end_time <- max(valid_vals, na.rm = TRUE)
+          start_time <- end_time - as.difftime(as.numeric(request_limits$obs_window_days) * 24, units = "hours")
+          point_da <- point_da$sel(valid_time = py_builtins$slice(as.character(start_time), as.character(end_time)))
+        }
+      }
+    }
+    point_da <- thin_dim_by_interval(point_da, "lead_time", interval_hours)
+    point_da <- thin_dim_by_interval(point_da, "valid_time", interval_hours)
+    point_da <- thin_dim_by_interval(point_da, "time", interval_hours)
+
     valid_time <- extract_time_axis(point_da)
 
     if (is.null(valid_time) || !length(valid_time)) return(NULL)
@@ -389,7 +481,14 @@ ui <- fluidPage(
       selectInput("variable", "Variable", choices = setNames(registry$canonical_variables$id, registry$canonical_variables$label)),
       radioButtons("units", "Unit system", choices = c("Metric" = "metric", "Imperial" = "imperial"), inline = TRUE),
       radioButtons("time_axis", "Time axis", choices = c("Valid time" = "valid_time", "Lead time" = "lead_time"), inline = TRUE),
-      sliderInput("lead_days", "Lead-time window (days)", min = 1, max = 35, value = 14),
+      sliderInput("lead_days", "Lead-time window (days)", min = 1, max = as.integer(request_limits$forecast_window_days_max), value = as.integer(request_limits$forecast_window_days_default)),
+      helpText(sprintf(
+        "Performance limits: forecast sampled every %sh, obs window fixed to %s days at %sh; max %s ensemble trace(s) per request.",
+        as.integer(request_limits$forecast_interval_hours),
+        as.integer(request_limits$obs_window_days),
+        as.integer(request_limits$obs_interval_hours),
+        as.integer(request_limits$max_ensemble_members_per_request)
+      )),
       checkboxInput("refresh_timeseries", "Refresh timeseries query", value = TRUE),
       checkboxInput("refresh_raster", "Refresh raster query", value = FALSE),
       selectInput(
@@ -530,7 +629,7 @@ server <- function(input, output, session) {
     prod(dim_sizes) * dtype_size
   }
 
-  estimate_point_request_nbytes <- function(ds, var_name, lead_hours, source_supports_ensemble = TRUE) {
+  estimate_point_request_nbytes <- function(ds, var_name, lead_hours, interval_hours = 6, source_supports_ensemble = TRUE, max_ensemble_members = 1) {
     if (is.null(ds) || !nzchar(var_name)) return(NA_real_)
     da <- tryCatch(ds[[var_name]], error = function(e) NULL)
     if (is.null(da)) return(NA_real_)
@@ -541,11 +640,22 @@ server <- function(input, output, session) {
     dims_names <- names(dim_sizes)
 
     if ("lead_time" %in% dims_names && is.finite(lead_hours)) {
-      dim_sizes[["lead_time"]] <- min(dim_sizes[["lead_time"]], as.numeric(lead_hours) + 1)
+      requested_points <- floor(as.numeric(lead_hours) / max(1, as.numeric(interval_hours))) + 1
+      dim_sizes[["lead_time"]] <- min(dim_sizes[["lead_time"]], as.numeric(requested_points))
+    }
+
+    for (time_dim in c("valid_time", "time")) {
+      if (time_dim %in% dims_names && is.finite(lead_hours)) {
+        requested_points <- floor(as.numeric(lead_hours) / max(1, as.numeric(interval_hours))) + 1
+        dim_sizes[[time_dim]] <- min(dim_sizes[[time_dim]], as.numeric(requested_points))
+      }
     }
 
     dim_sizes <- dim_sizes[!(names(dim_sizes) %in% c("latitude", "longitude", "init_time"))]
-    if (!source_supports_ensemble) {
+    if (source_supports_ensemble && any(c("ensemble_member", "member", "number") %in% names(dim_sizes))) {
+      ensemble_dim <- intersect(c("ensemble_member", "member", "number"), names(dim_sizes))[[1]]
+      dim_sizes[[ensemble_dim]] <- min(dim_sizes[[ensemble_dim]], max(1, as.numeric(max_ensemble_members)))
+    } else if (!source_supports_ensemble) {
       dim_sizes <- dim_sizes[!(names(dim_sizes) %in% c("ensemble_member", "member", "number"))]
     }
 
@@ -808,17 +918,26 @@ server <- function(input, output, session) {
       t0 <- Sys.time()
       rv$last_request_size <- NULL
 
+      forecast_lead_hours <- min(
+        isolate(input$lead_days) * 24,
+        as.numeric(request_limits$forecast_window_days_max) * 24
+      )
+      obs_lead_hours <- as.numeric(request_limits$obs_window_days) * 24
+
       point_forecast_nbytes <- estimate_point_request_nbytes(
         rv$forecast_ds,
         fvar,
-        lead_hours = isolate(input$lead_days) * 24,
-        source_supports_ensemble = isTRUE(src_row$supports_ensemble[[1]])
+        lead_hours = forecast_lead_hours,
+        interval_hours = as.numeric(request_limits$forecast_interval_hours),
+        source_supports_ensemble = isTRUE(src_row$supports_ensemble[[1]]),
+        max_ensemble_members = as.numeric(request_limits$max_ensemble_members_per_request)
       )
       point_obs_nbytes <- if (isolate(input$data_mode) == "obs + forecast" && !is.null(rv$obs_ds) && nzchar(ovar)) {
         estimate_point_request_nbytes(
           rv$obs_ds,
           ovar,
-          lead_hours = isolate(input$lead_days) * 24,
+          lead_hours = obs_lead_hours,
+          interval_hours = as.numeric(request_limits$obs_interval_hours),
           source_supports_ensemble = FALSE
         )
       } else {
@@ -846,7 +965,9 @@ server <- function(input, output, session) {
           extra = paste0(
             "lat=", sprintf("%.4f", rv$click_lat),
             ", lon=", sprintf("%.4f", rv$click_lon),
-            ", lead_hours=", isolate(input$lead_days) * 24,
+            ", lead_hours=", forecast_lead_hours,
+            ", interval_hours=", as.numeric(request_limits$forecast_interval_hours),
+            ", max_members=", as.numeric(request_limits$max_ensemble_members_per_request),
             ", supports_ensemble=", isTRUE(src_row$supports_ensemble[[1]])
           )
         )
@@ -858,7 +979,10 @@ server <- function(input, output, session) {
           rv$click_lat,
           rv$click_lon,
           source_supports_ensemble = isTRUE(src_row$supports_ensemble[[1]]),
-          lead_hours = isolate(input$lead_days) * 24
+          lead_hours = forecast_lead_hours,
+          interval_hours = as.numeric(request_limits$forecast_interval_hours),
+          max_ensemble_members = as.numeric(request_limits$max_ensemble_members_per_request),
+          mode = "forecast"
         )
         debug_log("refresh_data:point_forecast_done", "elapsed_ms=", round(as.numeric(difftime(Sys.time(), point_t0, units = "secs")) * 1000, 2))
 
@@ -872,7 +996,8 @@ server <- function(input, output, session) {
           extra = paste0(
             "lat=", sprintf("%.4f", rv$click_lat),
             ", lon=", sprintf("%.4f", rv$click_lon),
-            ", lead_hours=", isolate(input$lead_days) * 24,
+            ", lead_hours=", obs_lead_hours,
+            ", interval_hours=", as.numeric(request_limits$obs_interval_hours),
             ", supports_ensemble=FALSE"
           )
         )
@@ -883,7 +1008,10 @@ server <- function(input, output, session) {
             rv$click_lat,
             rv$click_lon,
             source_supports_ensemble = FALSE,
-            lead_hours = isolate(input$lead_days) * 24
+            lead_hours = obs_lead_hours,
+            interval_hours = as.numeric(request_limits$obs_interval_hours),
+            max_ensemble_members = 1,
+            mode = "obs"
           )
           debug_log("refresh_data:point_obs_done", "elapsed_ms=", round(as.numeric(difftime(Sys.time(), point_t0, units = "secs")) * 1000, 2))
         }
