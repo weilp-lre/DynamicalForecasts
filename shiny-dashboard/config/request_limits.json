@@ -1,0 +1,9 @@
+{
+  "forecast_window_days_default": 14,
+  "forecast_window_days_max": 14,
+  "forecast_interval_hours": 6,
+  "obs_window_days": 7,
+  "obs_interval_hours": 6,
+  "max_ensemble_members_per_request": 1,
+  "prefer_latest_init_time": true
+}
